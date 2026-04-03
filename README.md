@@ -1,3 +1,6 @@
+只加了ai生成的gui代码
+cargo build -p lecoo --release
+![alt text](image.png)
 <div align="center">
 <img src="branding\logo-2.png" alt="Logo" >
 
