@@ -1,0 +1,7 @@
+[package]
+# ...existing content...
+
+[package.metadata.winres]
+OriginalFilename = "lecoo.exe"
+LegalCopyright = "Copyright 2026"
+Icon = "src/icon.ico"
