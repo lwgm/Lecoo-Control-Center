@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::mpsc::Sender;
 use std::{panic, thread};
 use zbus::blocking::Connection;
@@ -72,6 +73,16 @@ trait LoginManager {
     /// PrepareForShutdown(start: bool)
     #[zbus(signal)]
     fn prepare_for_shutdown(&self, start: bool) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.UPower",
+    default_service = "org.freedesktop.UPower",
+    default_path = "/org/freedesktop/UPower"
+)]
+trait UPower {
+    #[zbus(property)]
+    fn on_battery(&self) -> zbus::Result<bool>;
 }
 
 pub fn run_as_service(tx: Sender<InternalEvent>) -> zbus::Result<()> {
@@ -161,6 +172,38 @@ pub fn run_as_service(tx: Sender<InternalEvent>) -> zbus::Result<()> {
         })
         .expect("failed to spawn logind-sleep");
 
+    // battery status
+    let tx_power = tx.clone();
+    let conn_power = conn.clone();
+    let _power_thread = thread::Builder::new()
+        .name("upower-monitor".into())
+        .spawn(move || {
+            let proxy = match UPowerProxyBlocking::new(&conn_power) {
+                Ok(p) => p,
+                Err(e) => { log::error!("upower proxy error: {e}"); return; }
+            };
+
+            let changed_stream = proxy.receive_on_battery_changed();
+
+            // TODO: Yes, if connect the charger to 98% and wait until it reaches max, the indicator WILL NOT update.
+            // and yes, i need to find a way to update it, or use full UPower proxy. but I'M SOOOO LAZY.
+            // who cares about power indicator :) It just works.
+            for changed in changed_stream {
+                if let Ok(on_battery) = changed.get() {
+                    let event = if on_battery {
+                        InternalEvent::ChargerDisconnected
+                    } else {
+                        InternalEvent::ChargerConnected
+                    };
+
+                    if tx_power.send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn upower-monitor thread");
+
     let proxy = LoginManagerProxyBlocking::new(&conn)?;
 
     for sig in proxy.receive_prepare_for_shutdown()? {
@@ -174,10 +217,13 @@ pub fn run_as_service(tx: Sender<InternalEvent>) -> zbus::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn get_system_info() -> (String, String) {
-    use std::fs;
+pub fn get_board_name() -> String {
+    fs::read_to_string("/sys/devices/virtual/dmi/id/board_name")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "Unknown Host".to_string())
+}
 
+pub fn get_system_info() -> (String, String, String) {
     let cpu_name = fs::read_to_string("/proc/cpuinfo")
         .unwrap_or_default()
         .lines()
@@ -194,5 +240,11 @@ pub fn get_system_info() -> (String, String) {
         .map(|s| s.trim_matches('"').to_string())
         .unwrap_or_else(|| "Linux".to_string());
 
-    (cpu_name, os_name)
+    let host_name = fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "Unknown Host".to_string());
+
+    let board_name = get_board_name();
+
+    (cpu_name, os_name, format!("{} ({})", host_name, board_name))
 }

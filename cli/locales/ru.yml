@@ -1,0 +1,98 @@
+_version: 1
+
+# Commands About
+cmd_app_about: "Консольная утилита управления Lecoo Control Center"
+cmd_info_about: "Получить информацию о встроенном контроллере (EC)"
+cmd_temps_about: "Вывести текущие температуры компонентов"
+cmd_fans_about: "Вывести текущую скорость вращения кулеров (об/мин)"
+cmd_monitoring_about: "Запустить мониторинг системных показателей в реальном времени"
+cmd_fan_about: "Настройка кулеров (например: `fan cpu auto`)"
+cmd_charge_about: "Показать или установить лимит заряда батареи"
+cmd_power_about: "Выбрать профиль энергопотребления"
+cmd_kbd_about: "Управление подсветкой клавиатуры"
+cmd_led_about: "Управление задним LED-кольцом"
+cmd_daemon_about: "Настройки фоновой службы (для опытных пользователей)"
+cmd_led_auto_about: "Автоматическое управление подсветкой (EC)"
+cmd_led_custom_about: "Установить яркость вручную"
+cmd_daemon_telemetry_about: "Управление настройками телеметрии"
+cmd_daemon_settings_about: "Управление внутренними настройками службы"
+cmd_daemon_version_about: "Показать версию фоновой службы"
+cmd_telemetry_enable_about: "Включить сбор телеметрии"
+cmd_telemetry_disable_about: "Отключить сбор телеметрии"
+cmd_telemetry_id_about: "Получить ID телеметрии"
+cmd_settings_reset_about: "Сбросить настройки службы до заводских"
+cmd_settings_read_about: "Показать текущую конфигурацию службы"
+cmd_settings_apply_about: "Применить сохраненное состояние службы"
+
+# Arguments Help
+arg_monitoring_rate_help: "Частота обновления в секундах (по умолчанию: 1.0)"
+arg_fan_target_help: "Целевой вентилятор (cpu/gpu/both)"
+arg_fan_mode_help: "Режим работы (auto/full/custom)"
+arg_fan_val_help: "Значение ШИМ (0-255)"
+arg_charge_limit_help: "Установить режим ограничения заряда батареи"
+arg_power_profile_help: "Выбрать профиль питания"
+arg_kbd_mode_help: "Выбрать режим/уровень подсветки"
+arg_kbd_val_help: "Пользовательское значение яркости (0-255)"
+arg_led_val_help: "Яркость LED-кольца (0-255)"
+
+# Power Profile Values Help
+arg_power_profile_silent_help: "Тихий режим (минимальное энергопотребление)"
+arg_power_profile_default_help: "Стандартный сбалансированный режим"
+arg_power_profile_perf_help: "Режим производительности (максимальная мощность)"
+
+# Fan Target Values Help
+arg_fan_target_cpu_help: "Вентилятор процессора"
+arg_fan_target_gpu_help: "Вентилятор видеокарты"
+arg_fan_target_both_help: "Оба вентилятора (ЦП и ГП)"
+
+# Fan Mode Values Help
+arg_fan_mode_auto_help: "Автоматическое управление (EC)"
+arg_fan_mode_full_help: "Полная скорость (100%)"
+arg_fan_mode_custom_help: "Пользовательская скважность ШИМ"
+
+# Keyboard Backlight Values Help
+arg_kbd_mode_off_help: "Подсветка выключена"
+arg_kbd_mode_low_help: "Низкая яркость"
+arg_kbd_mode_medium_help: "Средняя яркость"
+arg_kbd_mode_high_help: "Высокая яркость"
+arg_kbd_mode_custom_help: "Пользовательское значение яркости"
+
+# Charge Limit Values Help
+arg_charge_limit_full_help: "Полная емкость (заряд до 100%)"
+arg_charge_limit_high_help: "Высокая емкость (заряд до 95%)"
+arg_charge_limit_balanced_help: "Сбалансированный режим (заряд до 80%)"
+arg_charge_limit_lifespan_help: "Максимальный срок службы (заряд до 60%)"
+arg_charge_limit_desk_help: "Настольный режим (заряд до 40%)"
+
+arg_charge_limit_long_help: |
+  Установить режим ограничения заряда батареи (FlexiCharger).
+
+  Доступные режимы:
+    - full:     Полная емкость (заряд до 100%)
+    - high:     Высокая емкость (заряд до 95%)
+    - balanced: Сбалансированный режим (заряд до 80%)
+    - lifespan: Максимальный срок службы (заряд до 60%)
+    - desk:     Настольный режим (заряд до 40%)
+
+# Messages & Errors
+err_daemon_connection: "Не удалось подключиться к фоновой службе! Она запущена?"
+msg_monitoring_start: "Мониторинг запущен. Интервал обновления: %{rate} мс"
+msg_monitoring_loop: "🌡️ ЦП: %{cpu}°C, Сис: %{sys}°C | 💨 Кулеры: %{cpu_f} об/мин (ЦП), %{gpu_f} об/мин (ГП)"
+msg_success: "Готово."
+msg_error: "❌ Ошибка: %{msg}"
+
+# Responses
+resp_sys_info: "Контроллер: %{chip} (Рев. %{rev})\nСмещение HRAM: 0x%{offset}\nВерсия службы: %{ver}"
+resp_fans_rpm: "⚙️ Скорость вращения:\n   ЦП: %{cpu} об/мин\n   ГП: %{gpu} об/мин"
+resp_temps: "🌡️ Температуры:\n   ЦП: %{cpu} °C\n   Система: %{sys} °C"
+resp_kbd_backlight: "💡 Подсветка клавиатуры:\n   Уровень: %{lvl}"
+resp_charge_title: "🔋 Лимит заряда батареи (FlexiCharger):"
+resp_charge_full: "   Режим: Полная емкость (зарядка до 100%)"
+resp_charge_range: "   Начинать зарядку при: %{min}%\n   Останавливать при:    %{max}%"
+resp_charge_current: "   Текущий уровень заряда: %{cur}%"
+resp_power_title: "⚡ Профиль энергопотребления:"
+resp_power_current: "   Активен: %{prof}"
+resp_telemetry_disabled: |
+  🔗 Анонимная телеметрия отключена. Отчеты помогают улучшать качество проекта.
+  Пожалуйста, включите ее — это бесплатно и полностью анонимно :)
+resp_telemetry_id: "🔗 ID телеметрии: 0x%{id}"

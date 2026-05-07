@@ -4,29 +4,23 @@ use super::EcDevice;
 
 pub fn apply_fan_mode(ec: &EcDevice, fan: &FanIndex, mode: &FanMode) -> Result<()> {
     let thermal_policy_override: u16 = match fan {
-        FanIndex::Cpu => 0x4F,
-        FanIndex::Gpu => 0x4E,
+        FanIndex::Cpu => ec.offsets.ram_thermal_policy_cpu,
+        FanIndex::Gpu => ec.offsets.ram_thermal_policy_gpu,
     };
 
-    match mode {
-        FanMode::Auto => {
-            ec.write_ram(thermal_policy_override, 0x00)?;
-            ec.write_ram(*fan as u16, 0)?;
-        }
-        FanMode::Full => {
-            ec.write_ram(thermal_policy_override, 0x40)?;
-            ec.write_ram(*fan as u16, 150)?;
-
-        }
-        FanMode::Custom(duty) => {
-            if *duty > 220 {
-                bail!("Duty cycle too high, it's dangerous!");
+    let (policy, duty) = match mode {
+        FanMode::Auto => (0x00, 0),
+        FanMode::Full => (0x40, 150),
+        FanMode::Custom(d) => {
+            if *d > 220 {
+                bail!("Requested fan duty cycle ({}) exceeds safe limit (220).", d);
             }
-
-            ec.write_ram(thermal_policy_override, 0x40)?;
-            ec.write_ram(*fan as u16, *duty)?;
+            (0x40, *d)
         }
     };
 
-    Ok(())
+    ec.with_batch(|b| {
+        b.write_ram(thermal_policy_override, policy)?;
+        b.write_ram(*fan as u16, duty)
+    })
 }

@@ -1,5 +1,5 @@
 use bincode::config::standard;
-use ipc::{TelemetryData, TelemetryPayload};
+use ipc::{TelemetryData, TelemetryPayload, TelemetryDataV1, TelemetryPayloadV1};
 use log::{error, info, warn};
 use rusqlite::{params, Connection};
 use simplelog::SimpleLogger;
@@ -40,10 +40,17 @@ fn main() {
             offset TEXT NOT NULL,
             cpu TEXT NOT NULL,
             os TEXT NOT NULL,
+            motherboard TEXT,
             FOREIGN KEY(raw_id) REFERENCES raw_telemetry(id)
         )",
         [],
     ).expect("Failed to create startup_events table");
+
+    // TODO: remove later
+    let _ = conn.execute(
+        "ALTER TABLE startup_events ADD COLUMN motherboard TEXT",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS status_events (
@@ -82,6 +89,10 @@ fn main() {
         let db_clone = Arc::clone(&db);
 
         thread::spawn(move || {
+            if request.method() == &Method::Get && request.url() == "/telemetry/health" {
+                let _ = request.respond(Response::empty(200));
+                return;
+            }
             if request.method() != &Method::Post || request.url() != "/telemetry" {
                 let _ = request.respond(Response::empty(404));
                 return;
@@ -121,16 +132,17 @@ fn main() {
             let config = standard()
                 .with_limit::<{ 64 * 1024 }>();
 
+            // Try to deserialize as V2 (new format with motherboard)
             match bincode::decode_from_slice::<TelemetryPayload, _>(&buffer, config) {
                 Ok((payload, _)) => {
                     let client_uuid = format!("0x{:016X}", payload.id);
 
                     let insert_result = match payload.data {
-                        TelemetryData::Startup { firmware, offset, cpu, os } => {
+                        TelemetryData::Startup { firmware, offset, cpu, os, motherboard } => {
                             let hex_offset = format!("0x{:04X}", offset);
                             lock.execute(
-                                "INSERT INTO startup_events (raw_id, client_uuid, daemon_version, firmware, offset, cpu, os) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                params![raw_id, client_uuid, &daemon_version, firmware, hex_offset, cpu, os],
+                                "INSERT INTO startup_events (raw_id, client_uuid, daemon_version, firmware, offset, cpu, os, motherboard) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                params![raw_id, client_uuid, &daemon_version, firmware, hex_offset, cpu, os, motherboard],
                             )
                         }
                         TelemetryData::Status { profile, temps, fans } => {
@@ -148,16 +160,53 @@ fn main() {
                     };
 
                     if let Err(e) = insert_result {
-                        error!("Failed to insert parsed telemetry (Raw ID: {}): {}", raw_id, e);
+                        error!("Failed to insert parsed telemetry V2 (Raw ID: {}): {}", raw_id, e);
                         let _ = request.respond(Response::empty(500));
                     } else {
                         let _ = request.respond(Response::empty(201));
                     }
                 }
-                Err(e) => {
-                    // Deserialization failed, but raw data is securely stored
-                    warn!("Deserialization failed. Raw ID: {}, Error: {}", raw_id, e);
-                    let _ = request.respond(Response::empty(202));
+                Err(_) => {
+                    // Try to deserialize as V1 (old format without motherboard)
+                    match bincode::decode_from_slice::<TelemetryPayloadV1, _>(&buffer, config) {
+                        Ok((payload, _)) => {
+                            let client_uuid = format!("0x{:016X}", payload.id);
+
+                            let insert_result = match payload.data {
+                                TelemetryDataV1::Startup { firmware, offset, cpu, os } => {
+                                    let hex_offset = format!("0x{:04X}", offset);
+                                    lock.execute(
+                                        "INSERT INTO startup_events (raw_id, client_uuid, daemon_version, firmware, offset, cpu, os, motherboard) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                        params![raw_id, client_uuid, &daemon_version, firmware, hex_offset, cpu, os, None::<String>],
+                                    )
+                                }
+                                TelemetryDataV1::Status { profile, temps, fans } => {
+                                    lock.execute(
+                                        "INSERT INTO status_events (raw_id, client_uuid, daemon_version, profile, temp_1, temp_2, fan_1, fan_2) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                        params![raw_id, client_uuid, &daemon_version, format!("{:?}", profile), temps[0], temps[1], fans[0], fans[1]],
+                                    )
+                                }
+                                TelemetryDataV1::Panic { error } => {
+                                    lock.execute(
+                                        "INSERT INTO panic_events (raw_id, client_uuid, daemon_version, error_msg) VALUES (?1, ?2, ?3, ?4)",
+                                        params![raw_id, client_uuid, &daemon_version, error],
+                                    )
+                                }
+                            };
+
+                            if let Err(e) = insert_result {
+                                error!("Failed to insert parsed telemetry V1 (Raw ID: {}): {}", raw_id, e);
+                                let _ = request.respond(Response::empty(500));
+                            } else {
+                                let _ = request.respond(Response::empty(201));
+                            }
+                        }
+                        Err(e) => {
+                            // Both V1 and V2 deserialization failed, but raw data is securely stored
+                            warn!("Deserialization failed for both V1 and V2. Raw ID: {}, Error: {}", raw_id, e);
+                            let _ = request.respond(Response::empty(202));
+                        }
+                    }
                 }
             }
         });

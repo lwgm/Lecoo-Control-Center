@@ -1,0 +1,98 @@
+_version: 1
+
+# Commands About
+cmd_app_about: "Lecoo Control Center CLI"
+cmd_info_about: "Get info about the embedded controller"
+cmd_temps_about: "Get system temperatures"
+cmd_fans_about: "Get current fan speeds (RPM)"
+cmd_monitoring_about: "Get real-time monitoring of temps and fans"
+cmd_fan_about: "Control fan settings (e.g., `fan cpu auto`)"
+cmd_charge_about: "Get or set battery charge limit"
+cmd_power_about: "Set system power profile"
+cmd_kbd_about: "Set keyboard backlight level"
+cmd_led_about: "Control rear LED ring"
+cmd_daemon_about: "Control daemon settings (Advanced)"
+cmd_led_auto_about: "Automatic EC control for the LED"
+cmd_led_custom_about: "Set manual static brightness"
+cmd_daemon_telemetry_about: "Change telemetry settings"
+cmd_daemon_settings_about: "Change daemon internal settings"
+cmd_daemon_version_about: "Show daemon version"
+cmd_telemetry_enable_about: "Enable telemetry"
+cmd_telemetry_disable_about: "Disable telemetry"
+cmd_telemetry_id_about: "Get telemetry ID"
+cmd_settings_reset_about: "Reset daemon settings to defaults"
+cmd_settings_read_about: "Show current daemon settings"
+cmd_settings_apply_about: "Apply saved daemon state"
+
+# Arguments Help
+arg_monitoring_rate_help: "Update rate in seconds (default: 1.0)"
+arg_fan_target_help: "Target fan (cpu/gpu/both)"
+arg_fan_mode_help: "Fan mode (auto/full/custom)"
+arg_fan_val_help: "Custom PWM value (0-255)"
+arg_charge_limit_help: "Set battery charge limit mode"
+arg_power_profile_help: "Select power profile"
+arg_kbd_mode_help: "Select backlight mode/level"
+arg_kbd_val_help: "Custom brightness value (0-255)"
+arg_led_val_help: "LED brightness value (0-255)"
+
+# Power Profile Values Help
+arg_power_profile_silent_help: "Silent mode (lowest power consumption)"
+arg_power_profile_default_help: "Default balanced mode"
+arg_power_profile_perf_help: "Performance mode (maximum power)"
+
+# Fan Target Values Help
+arg_fan_target_cpu_help: "CPU fan"
+arg_fan_target_gpu_help: "GPU fan"
+arg_fan_target_both_help: "Both CPU and GPU fans"
+
+# Fan Mode Values Help
+arg_fan_mode_auto_help: "Automatic EC control"
+arg_fan_mode_full_help: "Full speed (100%)"
+arg_fan_mode_custom_help: "Custom PWM duty cycle"
+
+# Keyboard Backlight Values Help
+arg_kbd_mode_off_help: "Backlight off"
+arg_kbd_mode_low_help: "Low brightness"
+arg_kbd_mode_medium_help: "Medium brightness"
+arg_kbd_mode_high_help: "High brightness"
+arg_kbd_mode_custom_help: "Custom brightness value"
+
+# Charge Limit Values Help
+arg_charge_limit_full_help: "Full capacity (100%)"
+arg_charge_limit_high_help: "High capacity (95%)"
+arg_charge_limit_balanced_help: "Balanced mode (80%)"
+arg_charge_limit_lifespan_help: "Maximum battery lifespan (60%)"
+arg_charge_limit_desk_help: "Desk mode (40%)"
+
+arg_charge_limit_long_help: |
+  Set battery charge limit mode (FlexiCharger).
+
+  Available modes:
+    - full:     Full capacity (100%)
+    - high:     High capacity (95%)
+    - balanced: Balanced mode (80%)
+    - lifespan: Maximum battery lifespan (60%)
+    - desk:     Desk mode (40%)
+
+# Messages & Errors
+err_daemon_connection: "Failed to connect to daemon! Is it running?"
+msg_monitoring_start: "Monitoring enabled. Update rate: %{rate} ms"
+msg_monitoring_loop: "🌡️ CPU: %{cpu}°C, Sys: %{sys}°C | 💨 Fans: %{cpu_f} RPM (CPU), %{gpu_f} RPM (GPU)"
+msg_success: "Done."
+msg_error: "❌ Error: %{msg}"
+
+# Responses
+resp_sys_info: "Controller: %{chip} (Rev %{rev})\nHRAM Offset: 0x%{offset}\nDaemon Version: %{ver}"
+resp_fans_rpm: "⚙️ Fan Speeds:\n   CPU: %{cpu} RPM\n   GPU: %{gpu} RPM"
+resp_temps: "🌡️ Temperatures:\n   CPU: %{cpu} °C\n   System: %{sys} °C"
+resp_kbd_backlight: "💡 Keyboard Backlight:\n   Level: %{lvl}"
+resp_charge_title: "🔋 Charge Limit (FlexiCharger):"
+resp_charge_full: "   Mode: Full Capacity (Charges to 100%)"
+resp_charge_range: "   Start charging at: %{min}%\n   Stop charging at:  %{max}%"
+resp_charge_current: "   Current Battery Charge: %{cur}%"
+resp_power_title: "⚡ Power Profile:"
+resp_power_current: "   Current: %{prof}"
+resp_telemetry_disabled: |
+  🔗 Anonymous Telemetry Disabled. Telemetry helps me improve the quality of this project.
+  Please consider enabling it, it's free and anonymous :)
+resp_telemetry_id: "🔗 Telemetry ID: 0x%{id}"

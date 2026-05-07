@@ -2,11 +2,25 @@ use std::io::{self, Write};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use ipc::{ChargeLimit, FanIndex, FanMode, IpcClient, IpcRequest, IpcResponse, KeyboardBacklightLevel, PowerLedMode, PowerProfile};
+use ipc::{
+    ChargeLimit, DaemonCommand, DaemonResponse, FanIndex, FanMode, IpcClient, IpcRequest,
+    IpcResponse, KeyboardBacklightLevel, PowerLedMode, PowerProfile,
+};
+
+// Initialize i18n
+rust_i18n::i18n!("locales", fallback = "en");
+use rust_i18n::t;
+
+// Macro to simplify localization in clap attributes
+macro_rules! loc {
+    ($key:expr) => {
+        t!($key).to_string()
+    };
+}
 
 #[derive(Parser)]
 #[command(name = "lecoo-ctrl")]
-#[command(version, about = "Lecoo Control Center CLI", long_about = None)]
+#[command(version, about = loc!("cmd_app_about"), long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -14,57 +28,65 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Get info about the embedded controller
+    #[command(about = loc!("cmd_info_about"))]
     Info,
 
-    /// Get system temperatures
+    #[command(about = loc!("cmd_temps_about"))]
     Temps,
 
-    /// Get current fan speeds (RPM)
+    #[command(about = loc!("cmd_fans_about"))]
     Fans,
 
-    /// Get real-time monitoring of temps and fans
+    #[command(about = loc!("cmd_monitoring_about"))]
     Monitoring {
-        rate: Option<f32>
+        #[arg(help = loc!("arg_monitoring_rate_help"))]
+        rate: Option<f32>,
     },
 
-    /// Control fan settings (e.g., `fan cpu auto`, `fan gpu custom 150`)
+    #[command(about = loc!("cmd_fan_about"))]
     Fan {
-        #[arg(value_enum)]
+        #[arg(value_enum, help = loc!("arg_fan_target_help"))]
         target: CliFanIndex,
 
-        #[arg(value_enum)]
+        #[arg(value_enum, help = loc!("arg_fan_mode_help"))]
         mode: CliFanMode,
 
+        #[arg(help = loc!("arg_fan_val_help"))]
         val: Option<u8>,
     },
 
-    /// Get or set battery charge limit
+    #[command(about = loc!("cmd_charge_about"))]
     Charge {
-        /// Empty to read limit. To set, use: full, high, balanced, lifespan, desk
-        #[arg(value_parser = parse_charge_arg)]
-        limit: Option<ChargeLimit>,
+        #[arg(
+            value_enum,
+            help = loc!("arg_charge_limit_help"),
+            long_help = loc!("arg_charge_limit_long_help")
+        )]
+        limit: Option<CliChargeLimit>,
     },
 
-    /// Set system power profile
+    #[command(about = loc!("cmd_power_about"))]
     Power {
-        #[arg(value_enum)]
+        #[arg(value_enum, help = loc!("arg_power_profile_help"))]
         profile: Option<CliPowerProfile>,
     },
 
-    /// Set keyboard backlight level (0-3)
+    #[command(about = loc!("cmd_kbd_about"))]
     Kbd {
-        #[arg(value_parser = clap::value_parser!(u8).range(0..=3))]
-        level: Option<u8>,
+        #[arg(value_enum, help = loc!("arg_kbd_mode_help"))]
+        mode: Option<CliKbdMode>,
+
+        #[arg(help = loc!("arg_kbd_val_help"))]
+        val: Option<u8>,
     },
 
-    /// Control rear LED ring (e.g., `led auto`, `led custom 255`)
+    #[command(about = loc!("cmd_led_about"))]
     Led {
         #[command(subcommand)]
         action: CliLedAction,
     },
 
-    /// Control daemon settings, only for advanced users
+    #[command(about = loc!("cmd_daemon_about"))]
     Daemon {
         #[command(subcommand)]
         action: CliDaemonAction,
@@ -73,146 +95,155 @@ enum Commands {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum CliPowerProfile {
+    #[value(help = loc!("arg_power_profile_silent_help"))]
     Silent,
+    #[value(help = loc!("arg_power_profile_default_help"))]
     Default,
+    #[value(help = loc!("arg_power_profile_perf_help"))]
     Perf,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum CliFanIndex {
+    #[value(help = loc!("arg_fan_target_cpu_help"))]
     Cpu,
+    #[value(help = loc!("arg_fan_target_gpu_help"))]
     Gpu,
+    #[value(help = loc!("arg_fan_target_both_help"))]
     Both,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum CliFanMode {
+    #[value(help = loc!("arg_fan_mode_auto_help"))]
     Auto,
+    #[value(help = loc!("arg_fan_mode_full_help"))]
     Full,
+    #[value(help = loc!("arg_fan_mode_custom_help"))]
+    Custom,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum CliKbdMode {
+    #[value(help = loc!("arg_kbd_mode_off_help"))]
+    Off,
+    #[value(help = loc!("arg_kbd_mode_low_help"))]
+    Low,
+    #[value(help = loc!("arg_kbd_mode_medium_help"))]
+    Medium,
+    #[value(help = loc!("arg_kbd_mode_high_help"))]
+    High,
+    #[value(help = loc!("arg_kbd_mode_custom_help"))]
     Custom,
 }
 
 #[derive(Subcommand, Clone)]
 enum CliLedAction {
-    /// Let EC control the LED automatically
+    #[command(about = loc!("cmd_led_auto_about"))]
     Auto,
-    /// Set manual static brightness (0-255)
-    Custom { val: u8 },
-    // todo: add others
+    #[command(about = loc!("cmd_led_custom_about"))]
+    Custom {
+        #[arg(help = loc!("arg_led_val_help"))]
+        val: u8
+    },
 }
 
 #[derive(Clone, Subcommand)]
 enum CliDaemonAction {
-    /// Change telemetry settings
+    #[command(about = loc!("cmd_daemon_telemetry_about"))]
     Telemetry {
         #[command(subcommand)]
-        telemetry_action: CliTelemetryAction
+        telemetry_action: CliTelemetryAction,
     },
-
-    /// Change daemon settings
+    #[command(about = loc!("cmd_daemon_settings_about"))]
     Settings {
         #[command(subcommand)]
-        settings_action: CliSettingsAction
+        settings_action: CliSettingsAction,
     },
-
-    /// Get daemon version
+    #[command(about = loc!("cmd_daemon_version_about"))]
     Version,
 }
 
 #[derive(Subcommand, Clone)]
 enum CliTelemetryAction {
-    /// Enable telemetry
+    #[command(about = loc!("cmd_telemetry_enable_about"))]
     Enable,
-    /// Disable telemetry
+    #[command(about = loc!("cmd_telemetry_disable_about"))]
     Disable,
-    /// Get telemetry ID
+    #[command(about = loc!("cmd_telemetry_id_about"))]
     Id,
 }
 
 #[derive(Subcommand, Clone)]
 enum CliSettingsAction {
-    /// Reset daemon settings to default
+    #[command(about = loc!("cmd_settings_reset_about"))]
     Reset,
-    /// Read daemon settings
+    #[command(about = loc!("cmd_settings_read_about"))]
     Read,
-    /// Apply saved settings state
+    #[command(about = loc!("cmd_settings_apply_about"))]
     Apply,
 }
 
-// --- Custom Parsers ---
-
-fn parse_charge_arg(s: &str) -> Result<ChargeLimit, String> {
-    match s.to_lowercase().as_str() {
-        "full" => Ok(ChargeLimit::FullCapacity),
-        "high" => Ok(ChargeLimit::HighCapacity),
-        "balanced" => Ok(ChargeLimit::Balanced),
-        "lifespan" => Ok(ChargeLimit::MaximumLifespan),
-        "desk" => Ok(ChargeLimit::DeskMode),
-        _ => Err("Use a preset: full, high, balanced, lifespan, desk".to_string()),
-        // other => {
-        //     if let Ok(val) = other.parse::<u8>() {
-        //         if val <= 100 {
-        //             Ok(ChargeLimit::Custom(val))
-        //         } else {
-        //             Err("Limit must be between 0 and 100".to_string())
-        //         }
-        //     } else {
-        //         Err("Use a percentage (0-100) or preset: full, balanced, lifespan".to_string())
-        //     }
-        // }
-    }
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum CliChargeLimit {
+    #[value(help = loc!("arg_charge_limit_full_help"))]
+    Full,
+    #[value(help = loc!("arg_charge_limit_high_help"))]
+    High,
+    #[value(help = loc!("arg_charge_limit_balanced_help"))]
+    Balanced,
+    #[value(help = loc!("arg_charge_limit_lifespan_help"))]
+    Lifespan,
+    #[value(help = loc!("arg_charge_limit_desk_help"))]
+    Desk,
 }
 
-// fn parse_hex_or_dec(s: &str) -> Result<u16, std::num::ParseIntError> {
-//     if let Some(hex) = s.strip_prefix("0x") {
-//         u16::from_str_radix(hex, 16)
-//     } else {
-//         s.parse::<u16>()
-//     }
-// }
-
 fn main() -> anyhow::Result<()> {
+    // Determine system locale and set it for the application
+    if let Some(sys_locale) = sys_locale::get_locale() {
+        rust_i18n::set_locale(&sys_locale);
+    }
+
     let cli = Cli::parse();
-    let mut client = IpcClient::connect().context("Failed to connect to daemon! Is it running?")?;
+
+    // Lazy connection with localized error context
+    let mut client = IpcClient::connect()
+        .with_context(|| loc!("err_daemon_connection"))?;
 
     let request = match cli.command {
         Commands::Info => IpcRequest::GetSystemState,
         Commands::Temps => IpcRequest::GetTemperatures,
         Commands::Fans => IpcRequest::GetFansRPM,
 
-
         Commands::Monitoring { rate } => {
             let update_rate = (rate.unwrap_or(1.0) * 1000.0) as u64;
-            println!("Monitoring enabled. Update rate: {} ms", update_rate);
+            println!("{}", t!("msg_monitoring_start", rate = update_rate));
             loop {
                 let IpcResponse::Temp(cpu, system) = client.request(&IpcRequest::GetTemperatures)? else { unreachable!() };
                 let IpcResponse::FanRPM(cpu_fan, gpu_fan) = client.request(&IpcRequest::GetFansRPM)? else { unreachable!() };
 
-                print!("\r🌡️ CPU: {}°C, Sys: {}°C | 💨 Fans: {} RPM (CPU), {} RPM (GPU)      ",
-                    cpu, system, cpu_fan, gpu_fan
-                );
+                print!("\r{}      ", t!("msg_monitoring_loop",
+                    cpu = cpu, sys = system, cpu_f = cpu_fan, gpu_f = gpu_fan
+                ));
                 io::stdout().flush().unwrap();
-
-                std::thread::sleep(
-                    std::time::Duration::from_millis(update_rate)
-                );
+                std::thread::sleep(std::time::Duration::from_millis(update_rate));
             }
         }
 
         Commands::Power { profile } => match profile {
             None => IpcRequest::GetPowerProfile,
             Some(p) => {
-                let power_profile = match p {
+                let power_p = match p {
                     CliPowerProfile::Silent => PowerProfile::Silent,
                     CliPowerProfile::Default => PowerProfile::Default,
                     CliPowerProfile::Perf => PowerProfile::Performance,
                 };
-                IpcRequest::SetPowerProfile(power_profile)
+                IpcRequest::SetPowerProfile(power_p)
             }
         }
 
         Commands::Fan { target, mode, val } => {
-            let fan_mode = match mode {
+            let fan_m = match mode {
                 CliFanMode::Auto => FanMode::Auto,
                 CliFanMode::Full => FanMode::Full,
                 CliFanMode::Custom => FanMode::Custom(val.unwrap_or(0)),
@@ -221,27 +252,35 @@ fn main() -> anyhow::Result<()> {
                 CliFanIndex::Cpu => FanIndex::Cpu,
                 CliFanIndex::Gpu => FanIndex::Gpu,
                 CliFanIndex::Both => {
-                    let _: IpcResponse = client.request(&IpcRequest::SetFanMode { fan: FanIndex::Cpu, mode: fan_mode } )?;
+                    let _: IpcResponse = client.request(&IpcRequest::SetFanMode { fan: FanIndex::Cpu, mode: fan_m } )?;
                     FanIndex::Gpu
                 },
             };
-            IpcRequest::SetFanMode { fan: fan_idx, mode: fan_mode }
+            IpcRequest::SetFanMode { fan: fan_idx, mode: fan_m }
         }
 
-        Commands::Charge { limit } => {
-            match limit {
-                Some(l) => IpcRequest::SetChargeLimit(l),
-                None => IpcRequest::GetChargeLimit,
+        Commands::Charge { limit } => match limit {
+            Some(cli_limit) => {
+                let ipc_limit = match cli_limit {
+                    CliChargeLimit::Full => ChargeLimit::FullCapacity,
+                    CliChargeLimit::High => ChargeLimit::HighCapacity,
+                    CliChargeLimit::Balanced => ChargeLimit::Balanced,
+                    CliChargeLimit::Lifespan => ChargeLimit::MaximumLifespan,
+                    CliChargeLimit::Desk => ChargeLimit::DeskMode,
+                };
+                IpcRequest::SetChargeLimit(ipc_limit)
             }
-        }
+            None => IpcRequest::GetChargeLimit,
+        },
 
-        Commands::Kbd { level } => match level {
-            Some(l) => {
-                let lvl = match l {
-                    0 => KeyboardBacklightLevel::Off,
-                    1 => KeyboardBacklightLevel::Low,
-                    2 => KeyboardBacklightLevel::Medium,
-                    _ => KeyboardBacklightLevel::High,
+        Commands::Kbd { mode, val } => match mode {
+            Some(m) => {
+                let lvl = match m {
+                    CliKbdMode::Off => KeyboardBacklightLevel::Off,
+                    CliKbdMode::Low => KeyboardBacklightLevel::Low,
+                    CliKbdMode::Medium => KeyboardBacklightLevel::Medium,
+                    CliKbdMode::High => KeyboardBacklightLevel::High,
+                    CliKbdMode::Custom => KeyboardBacklightLevel::Custom(val.unwrap_or(255)),
                 };
                 IpcRequest::SetKeyboardBacklight(lvl)
             }
@@ -251,21 +290,21 @@ fn main() -> anyhow::Result<()> {
         Commands::Led { action } => {
             let led_m = match action {
                 CliLedAction::Auto => PowerLedMode::Auto,
-                CliLedAction::Custom { val } => PowerLedMode::Custom(val), // todo
+                CliLedAction::Custom { val } => PowerLedMode::Custom(val),
             };
             IpcRequest::SetLedMode(led_m)
         }
 
         Commands::Daemon { action } => match action {
             CliDaemonAction::Telemetry { telemetry_action } => match telemetry_action {
-                CliTelemetryAction::Enable => IpcRequest::DaemonCommand(ipc::DaemonCommand::ActivateTelemetry(true)),
-                CliTelemetryAction::Disable => IpcRequest::DaemonCommand(ipc::DaemonCommand::ActivateTelemetry(false)),
-                CliTelemetryAction::Id => IpcRequest::DaemonCommand(ipc::DaemonCommand::GetTelemetryId),
+                CliTelemetryAction::Enable => IpcRequest::DaemonCommand(DaemonCommand::ActivateTelemetry(true)),
+                CliTelemetryAction::Disable => IpcRequest::DaemonCommand(DaemonCommand::ActivateTelemetry(false)),
+                CliTelemetryAction::Id => IpcRequest::DaemonCommand(DaemonCommand::GetTelemetryId),
             },
             CliDaemonAction::Settings { settings_action } => match settings_action {
-                CliSettingsAction::Reset => IpcRequest::DaemonCommand(ipc::DaemonCommand::RestoreDefaults),
-                CliSettingsAction::Read => IpcRequest::DaemonCommand(ipc::DaemonCommand::GetSettings),
-                CliSettingsAction::Apply => IpcRequest::DaemonCommand(ipc::DaemonCommand::ApplySettings),
+                CliSettingsAction::Reset => IpcRequest::DaemonCommand(DaemonCommand::RestoreDefaults),
+                CliSettingsAction::Read => IpcRequest::DaemonCommand(DaemonCommand::GetSettings),
+                CliSettingsAction::Apply => IpcRequest::DaemonCommand(DaemonCommand::ApplySettings),
             },
             CliDaemonAction::Version => {
                 println!("{}.{}", client.daemon_version.0, client.daemon_version.1);
@@ -274,57 +313,55 @@ fn main() -> anyhow::Result<()> {
         },
     };
 
-    // --------------
-
     let res: IpcResponse = client.request(&request)?;
 
-    // Result handling
     match res {
-        IpcResponse::Success => println!("Done."),
-        IpcResponse::Message(msg) => println!("{}", msg),
+        IpcResponse::Success => println!("{}", t!("msg_success")),
+
+        IpcResponse::SystemInfo(chip, rev, offset, ver) => {
+            println!("{}", t!("resp_sys_info", chip = chip, rev = rev, offset = offset : {:04X}, ver = ver));
+        }
 
         IpcResponse::FanRPM(cpu, gpu) => {
-            println!("⚙️ Fan Speeds:");
-            println!("   CPU: {} RPM", cpu);
-            println!("   GPU: {} RPM", gpu);
+            println!("{}", t!("resp_fans_rpm", cpu = cpu, gpu = gpu));
         }
 
-        IpcResponse::Temp(cpu, system) => {
-            println!("🌡️ Temperatures:");
-            println!("   CPU: {} °C", cpu);
-            println!("   System: {} °C", system);
+        IpcResponse::Temp(cpu, sys) => {
+            println!("{}", t!("resp_temps", cpu = cpu, sys = sys));
         }
 
-        IpcResponse::KeyboardBacklight(level) => {
-            println!("💡 Keyboard Backlight:");
-            println!("   Level: {}", level);
+        IpcResponse::KeyboardBacklight(lvl) => {
+            println!("{}", t!("resp_kbd_backlight", lvl = lvl));
         }
 
-        IpcResponse::ChargeLimit(min, max, current) => {
-            println!("🔋 Charge Limit (FlexiCharger):");
+        IpcResponse::ChargeLimit(min, max, cur) => {
+            println!("{}", t!("resp_charge_title"));
             if min == 0 && max == 0 {
-                println!("   Mode: Full Capacity (Charges to 100%)");
+                println!("{}", t!("resp_charge_full"));
             } else {
-                println!("   Start charging at: {}%", min);
-                println!("   Stop charging at:  {}%", max);
+                println!("{}", t!("resp_charge_range", min = min, max = max));
             }
-            println!("   Current Battery Charge: {}%", current);
+            println!("{}", t!("resp_charge_current", cur = cur));
         }
 
-        IpcResponse::PowerLimit(profile) => {
-            println!("⚡ Power Profile:");
-            println!("   Current: {}", profile);
+        IpcResponse::PowerLimit(prof) => {
+            println!("{}", t!("resp_power_title"));
+            println!("{}", t!("resp_power_current", prof = prof));
+        }
+
+        IpcResponse::TelemetryDisabledInfo => {
+            println!("{}", t!("resp_telemetry_disabled"));
         }
 
         IpcResponse::Error(msg) => {
-            eprintln!("❌ Error: {}", msg);
+            eprintln!("{}", t!("msg_error", msg = msg));
             std::process::exit(1);
         }
 
-        IpcResponse::DaemonResponse(daemon_response) => match daemon_response {
-            ipc::DaemonResponse::Settings(settings) => println!("{:#?}", settings),
-            ipc::DaemonResponse::TelemetryId(id) => {
-                println!("🔗 Telemetry ID: 0x{:016X}", id);
+        IpcResponse::DaemonResponse(dr) => match dr {
+            DaemonResponse::Settings(s) => println!("{:#?}", s),
+            DaemonResponse::TelemetryId(id) => {
+                println!("{}", t!("resp_telemetry_id", id = id : {:016X}));
             },
         },
     }

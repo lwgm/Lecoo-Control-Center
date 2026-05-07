@@ -110,10 +110,7 @@ fn process_daemon_command(ec: &EcDevice, command: &DaemonCommand) -> Result<IpcR
                 Ok(IpcResponse::Success)
             } else {
                 telemetry::disable();
-                Ok(IpcResponse::Message(
-                    "Anonymous Telemetry Disabled. Telemetry helps me improve the quality of this project.\nPlease consider enabling it, it's free and anonymous :)"
-                        .to_string()
-                ))
+                Ok(IpcResponse::TelemetryDisabledInfo)
             }
         },
 
@@ -154,11 +151,7 @@ fn get_system_state(ec: &EcDevice) -> Result<IpcResponse> {
     let chip_name = format!("IT{:02X}{:02X}", chip_id1, chip_id2);
     let revision = format!("{:02X}", chip_ver);
 
-    let sys_info = format!("Controller: {} (Rev {}) \nHRAM Offset: 0x{:04X} \nDaemon Version: {}",
-        chip_name, revision, ec.hram_offset, crate::VERSION
-    );
-
-    Ok(IpcResponse::Message(sys_info))
+    Ok(IpcResponse::SystemInfo(chip_name, revision, ec.hram_offset, crate::VERSION.to_string()))
 }
 
 fn get_fans_rpm(ec: &EcDevice) -> Result<IpcResponse> {

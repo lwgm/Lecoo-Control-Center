@@ -16,6 +16,7 @@ Lecoo Control Center is a reverse-engineered, low-level Embedded Controller (EC)
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)]()
 
 🇷🇺 [Russian Readme here](README_RU.md)
+CN [中文 Readme 在这](README_CN.md)
 
 </div>
 
@@ -48,6 +49,28 @@ This software is primarily developed and tested on the Lecoo Pro 14 (Lecoo N155)
 
 If you successfully run this on an unlisted hardware revision or a different Emdoor chassis, please open an issue or contact me to update the compatibility list!
 
+## Installation
+
+### ⚠️ Recommended: Use Pre-built Binaries
+
+**Do NOT build from source unless you are a developer!** Download the latest pre-built release instead:
+
+👉 **[Download Latest Release](https://github.com/LaVashikk/Lecoo-Control-Center/releases/latest)**
+
+#### Windows Installation
+
+1. Download the `lecoo-*-windows.zip` archive from the releases page.
+2. Extract the archive to any folder.
+3. Right-click on `install.bat` and select **"Run as Administrator"**.
+4. Open a new terminal window and run `lecoo-ctrl help` to verify installation.
+
+#### Linux Installation
+
+1. Download the `lecoo-*-linux.tar.gz` archive from the releases page.
+2. Extract the archive: `tar -xzf lecoo-*-linux.tar.gz`
+3. Navigate to the extracted folder and run: `sudo ./install.sh`
+4. Use the `lecoo-ctrl` command to interact with the daemon.
+
 ## Known Issues
 
 * **Windows 11 Daemon Auto-start:** The background daemon currently fails to start automatically on Windows 11. The root cause is still under investigation.
@@ -55,6 +78,8 @@ If you successfully run this on an unlisted hardware revision or a different Emd
 * **Charge Indicator in Custom LED Mode:** When the rear LED ring is set to `custom` mode, the standard battery charge indicator stops functioning.
 * **LED Ring Stays On After Hard Shutdown:** If you perform a hard power-off (holding the power button) while the rear LED ring is in `custom` mode, the ring will remain lit. **Workaround:** Turn the laptop on and shut it down normally.
 * **Conflicts with Official Software:** Using the `power` command to adjust TDP profiles may conflict with the manufacturer's official software (`PowerModeUtility`). It is highly recommended to use only one of these tools at a time.
+* **Anti-cheat Software (Windows):** Some anti-cheat systems (such as FaceIT) may terminate the daemon process. This occurs because the daemon utilizes the official manufacturer driver to access the Embedded Controller.
+* **Secure Boot & Kernel Lockdown (Linux):** On distributions with Secure Boot enabled (e.g., Fedora), the daemon currently cannot access low-level I/O ports (`/dev/port`), resulting in a "Lockdown" error. This limitation will be addressed in future updates.
 
 ## Usage (CLI)
 
@@ -117,7 +142,7 @@ Telemetry is enabled by default to support the project's growth. If you prefer t
 lecoo-ctrl daemon telemetry disable
 ```
 
-## Building from Source
+## Building from Source (For Developers)
 
 Ensure you have the Rust toolchain installed.
 

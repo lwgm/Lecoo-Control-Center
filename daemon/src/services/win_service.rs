@@ -7,6 +7,8 @@ use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
 use ipc::TelemetryData;
+use winreg::enums::*;
+use winreg::RegKey;
 use log::{LevelFilter, info};
 use simplelog::{Config, WriteLogger};
 use windows_service::service::ServiceType;
@@ -28,22 +30,38 @@ pub fn run_as_service(tx: Sender<InternalEvent>) -> Result<(), windows_service::
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
-#[cfg(target_os = "windows")]
-pub fn get_system_info() -> (String, String) {
-    use winreg::enums::*;
-    use winreg::RegKey;
+pub fn get_board_name() -> String {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS")
+        .and_then(|key| key.get_value::<String, _>("BaseBoardProduct"))
+        .unwrap_or_else(|_| "Unknown Motherboard".to_string())
+}
 
+pub fn get_system_info() -> (String, String, String) {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
 
     let cpu_name = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0")
         .and_then(|key| key.get_value::<String, _>("ProcessorNameString"))
         .unwrap_or_else(|_| "Unknown CPU".to_string());
 
-    let os_name = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
-        .and_then(|key| key.get_value::<String, _>("ProductName"))
-        .unwrap_or_else(|_| "Windows".to_string());
+    let motherboard = get_board_name();
 
-    (cpu_name, os_name)
+    let (mut os_name, os_version) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
+        .map(|key| {
+            let name = key.get_value::<String, _>("ProductName").unwrap_or_else(|_| "Windows".to_string());
+            let build = key.get_value::<String, _>("CurrentBuild").unwrap_or_else(|_| "0".to_string());
+            (name, build)
+        })
+        .unwrap_or_else(|_| ("Windows".to_string(), "0".to_string()));
+
+    let build_number = os_version.parse().unwrap_or(0);
+
+    // restore the real windows version
+    if os_name.contains("Windows 10") && build_number >= 22000 {
+        os_name = os_name.replace("Windows 10", "Windows 11");
+    }
+
+    (cpu_name, format!("{} (Build {})", os_name, os_version), motherboard)
 }
 
 fn my_service_main(_arguments: Vec<std::ffi::OsString>) {
@@ -65,6 +83,20 @@ fn my_service_main(_arguments: Vec<std::ffi::OsString>) {
 
                 ServiceControl::PowerEvent(power_event) => {
                     match power_event {
+                        PowerEventParam::PowerStatusChange => {
+                            let mut status = SystemPowerStatus::default();
+                            unsafe {
+                                if GetSystemPowerStatus(&mut status) != 0 {
+                                    let event = if status.ac_line_status == 1 {
+                                        InternalEvent::ChargerConnected
+                                    } else {
+                                        InternalEvent::ChargerDisconnected
+                                    };
+                                    let _ = tx.send(event);
+                                }
+                            }
+                        }
+
                         PowerEventParam::Suspend => {
                             // INFO: The Lecoo Pro 14's sleep state (s2idle) is not functional, it's broken, but Fast Boot is considered suspended for the service.
                             // Treat as shutdown since we can't actually enter a proper sleep state.
@@ -114,6 +146,21 @@ fn my_service_main(_arguments: Vec<std::ffi::OsString>) {
         wait_hint: Duration::default(),
         process_id: None,
     }).unwrap();
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+struct SystemPowerStatus {
+    ac_line_status: u8,
+    battery_flag: u8,
+    battery_life_percent: u8,
+    system_status_flag: u8,
+    battery_life_time: u32,
+    battery_full_life_time: u32,
+}
+
+unsafe extern "system" {
+    fn GetSystemPowerStatus(lp_system_power_status: *mut SystemPowerStatus) -> i32;
 }
 
 pub fn init_logger() {

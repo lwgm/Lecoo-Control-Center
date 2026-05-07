@@ -58,14 +58,15 @@ pub enum IpcRequest {
     DaemonCommand(DaemonCommand),
 }
 
+
 /// Responses sent FROM the Daemon TO the Client.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum IpcResponse {
     /// Acknowledgment of a successful command execution
     Success,
 
-    /// Informational message from the daemon
-    Message(String),
+    /// Information about the embedded controller
+    SystemInfo(String, String, u16, String),
 
     /// RPM readings for both fans
     FanRPM(u16, u16),
@@ -84,6 +85,9 @@ pub enum IpcResponse {
 
     /// Response from the daemon
     DaemonResponse(DaemonResponse),
+
+    /// Information about telemetry being disabled
+    TelemetryDisabledInfo,
 
     /// Error message if something went wrong
     Error(String),

@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.0] - 2026-05-06
+
+### Added
+- Added insecure mode for daemon operation.
+- Implemented flexible keyboard backlight control with custom brightness values.
+- Added comprehensive i18n support for all CLI arguments (English and Russian).
+- Added charge indicator status control logic.
+- Added Simplified Chinese README documentation.
+
+### Changed
+- Improved help messages and output for the `charge` CLI command.
+- Updated telemetry with additional system information.
+- Updated README with installation instructions.
+
+### Fixed
+- Fixed EC state preservation during system Suspend/S4 (hibernation).
+- Fixed PWM mux and bypass timer for custom keyboard backlight control.
+- Fixed charge limit state being overridden on unknown values.
+
+### Refactored
+- Introduced atomic batching for EC I/O operations for better performance and safety.
+- Centralized EC offsets into board-specific profiles.
+- Simplified IPC protocol by removing `IpcResponse::Message`.
+
 ## [0.3.3] - 2026-03-23
 
 ### Added

@@ -11,3 +11,9 @@ edition = "2024"
 ipc = { path = "../ipc" }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
+rust-i18n = "3"
+sys-locale = "0.3"
+
+[package.metadata.i18n]
+available-locales = ["en", "ru"]
+default-locale = "en"
