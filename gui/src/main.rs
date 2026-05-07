@@ -119,7 +119,7 @@ const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 450.0;
 const BATTERY_WORKER_INTERVAL_SECS: u64 = 15;
 const SERVICE_WAIT_TIMEOUT_SECS: u64 = 20;
-const UI_VERSION: &str = "0.1.0-beta1";
+const UI_VERSION: &str = "0.2.0-beta1";
 
 #[derive(Clone, Copy)]
 enum PowerSourceStatus {
@@ -373,6 +373,8 @@ enum ServiceWaitState {
 struct LecooApp {
     client: Option<IpcClient>,
     daemon_version: String,
+    ec_chip: String,
+    ec_revision: String,
     connected: bool,
 
     current: CurrentSettings,
@@ -413,6 +415,8 @@ impl LecooApp {
         let mut app = Self {
             client: None,
             daemon_version: "unknown".to_string(),
+            ec_chip: String::new(),
+            ec_revision: String::new(),
             connected: false,
             current,
             draft,
@@ -487,6 +491,8 @@ impl LecooApp {
             self.connected = false;
             self.status = "Disconnected".to_string();
             self.daemon_version = "unknown".to_string();
+            self.ec_chip.clear();
+            self.ec_revision.clear();
             self.last_error = Some("Daemon service is not running".to_string());
             return Err("Daemon service is not running".to_string());
         }
@@ -507,6 +513,13 @@ impl LecooApp {
     }
 
     fn refresh_data(&mut self, force_sync_draft: bool) -> Result<(), String> {
+        if let IpcResponse::SystemInfo(chip, rev, _offset, _ver) =
+            self.request(&IpcRequest::GetSystemState)?
+        {
+            self.ec_chip = chip;
+            self.ec_revision = rev;
+        }
+
         if let IpcResponse::Temp(cpu, sys) = self.request(&IpcRequest::GetTemperatures)? {
             self.metrics.cpu_temp = Some(cpu);
             self.metrics.sys_temp = Some(sys);
@@ -873,7 +886,7 @@ impl LecooApp {
         let _ = label;
         match self.request(request)? {
             IpcResponse::Success => Ok(()),
-            IpcResponse::Message(_msg) => Ok(()),
+            IpcResponse::TelemetryDisabledInfo => Ok(()),
             IpcResponse::Error(err) => Err(err),
             other => Err(format!("Unexpected response: {:?}", other)),
         }
@@ -1514,6 +1527,8 @@ impl eframe::App for LecooApp {
                     self.connected = false;
                     self.client = None;
                     self.status = "Disconnected".to_string();
+                    self.ec_chip.clear();
+                    self.ec_revision.clear();
                     self.set_notice(
                         "Background refresh failed",
                         NoticeLevel::Error,
@@ -1524,6 +1539,8 @@ impl eframe::App for LecooApp {
                 self.last_error = Some("Not connected".to_string());
                 self.status = "Disconnected".to_string();
                 self.daemon_version = "unknown".to_string();
+                self.ec_chip.clear();
+                self.ec_revision.clear();
                 self.set_notice(
                     "Disconnected",
                     NoticeLevel::Error,
@@ -1534,11 +1551,14 @@ impl eframe::App for LecooApp {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Lecoo Control Center");
                 ui.label(format!("UI Version: {}", UI_VERSION));
                 ui.separator();
                 ui.label(format!("Daemon: {}", self.status));
                 ui.label(format!("Version: {}", self.daemon_version));
+                if !self.ec_chip.is_empty() {
+                    ui.separator();
+                    ui.label(format!("Model: {} Rev {}", self.ec_chip, self.ec_revision));
+                }
             });
         });
 
@@ -1846,12 +1866,13 @@ fn fmt_power_profile(profile: PowerProfile) -> &'static str {
     }
 }
 
-fn fmt_kbd(level: KeyboardBacklightLevel) -> &'static str {
+fn fmt_kbd(level: KeyboardBacklightLevel) -> String {
     match level {
-        KeyboardBacklightLevel::Off => "0",
-        KeyboardBacklightLevel::Low => "1",
-        KeyboardBacklightLevel::Medium => "2",
-        KeyboardBacklightLevel::High => "3",
+        KeyboardBacklightLevel::Off => "0".to_string(),
+        KeyboardBacklightLevel::Low => "1".to_string(),
+        KeyboardBacklightLevel::Medium => "2".to_string(),
+        KeyboardBacklightLevel::High => "3".to_string(),
+        KeyboardBacklightLevel::Custom(u) => format!("Custom: {u}/255"),
     }
 }
 
