@@ -1,0 +1,60 @@
+name: GUI Release
+
+on:
+  push:
+    tags:
+      - "gui-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows GUI
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build lecoo package
+        run: cargo build -p lecoo --release
+        # winres 会自动处理图标嵌入，不需要额外步骤
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          CLEAN_VERSION=${VERSION#gui-}  # gui-v1.0.0 -> v1.0.0
+          echo "clean_version=${CLEAN_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create ZIP
+        run: |
+          mkdir release
+          copy target\release\lecoo.exe release\
+          powershell Compress-Archive -Path release\* -DestinationPath lecoo-gui-${{ steps.version.outputs.clean_version }}-windows.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Lecoo GUI ${{ steps.version.outputs.clean_version }}"
+          files: lecoo-gui-${{ steps.version.outputs.clean_version }}-windows.zip
+          draft: false
+          generate_release_notes: true
