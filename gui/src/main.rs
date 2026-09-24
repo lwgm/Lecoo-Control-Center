@@ -1,10 +1,11 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 use chrono::Local;
 use eframe::egui;
-use ipc::{DaemonCommand, IpcClient, IpcRequest, IpcResponse};
+use ipc::{DaemonCommand, IpcClient, IpcError, IpcRequest, IpcResponse};
 use lecoo_types::{
+    caps::Capabilities,
     ec_types::{
-        BreathConfig, BreathDelay, BreathStep, ChargeIntent, ChargeLimit, FanIndex, FanMode,
+        BreathConfig, BreathDelay, BreathStep, ChargeIntent, ChargeRange, FanIndex, FanMode,
         KeyboardBacklightLevel, PowerLedMode, PowerProfile,
     },
     settings::CurrentSettings,
@@ -36,6 +37,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};
+#[cfg(target_os = "windows")]
+use std::cell::OnceCell;
 
 #[cfg(target_os = "windows")]
 fn is_service_running(service_name: &str) -> bool {
@@ -122,7 +125,7 @@ const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 450.0;
 const BATTERY_WORKER_INTERVAL_SECS: u64 = 15;
 const SERVICE_WAIT_TIMEOUT_SECS: u64 = 20;
-const UI_VERSION: &str = "0.2.0-beta1";
+const UI_VERSION: &str = "0.3.0-beta1";
 
 #[derive(Clone, Copy)]
 enum PowerSourceStatus {
@@ -214,29 +217,10 @@ struct AppDraft {
     keyboard_backlight: KeyboardBacklightLevel,
     fan_mode_cpu: FanMode,
     fan_mode_gpu: FanMode,
-    charge_limit: ChargeLimit,
+    /// 直接持有 daemon 的 `ChargeIntent`，不再降级成本地枚举。
+    charge_intent: ChargeIntent,
     led_mode: PowerLedMode,
     telemetry_enabled: bool,
-}
-
-/// Upstream replaced `CurrentSettings::charge_limit` with `ChargeIntent`.
-/// The GUI still exposes the five legacy presets, so map back where we can.
-fn charge_limit_from_intent(intent: ChargeIntent) -> Option<ChargeLimit> {
-    match intent {
-        ChargeIntent::Full => Some(ChargeLimit::FullCapacity),
-        ChargeIntent::Preserve(Some(range)) => ChargeLimit::from_predefined(range.min, range.max),
-        ChargeIntent::Preserve(None) | ChargeIntent::Freeze => None,
-    }
-}
-
-fn fmt_charge_intent(intent: ChargeIntent) -> &'static str {
-    match charge_limit_from_intent(intent) {
-        Some(limit) => fmt_charge_limit(limit),
-        None => match intent {
-            ChargeIntent::Freeze => "Frozen",
-            _ => "Custom",
-        },
-    }
 }
 
 impl From<CurrentSettings> for AppDraft {
@@ -246,11 +230,139 @@ impl From<CurrentSettings> for AppDraft {
             keyboard_backlight: value.keyboard_backlight,
             fan_mode_cpu: value.fan_mode_cpu,
             fan_mode_gpu: value.fan_mode_gpu,
-            charge_limit: charge_limit_from_intent(value.charge)
-                .unwrap_or(ChargeLimit::FullCapacity),
+            charge_intent: value.charge,
             led_mode: value.led_mode,
             telemetry_enabled: value.telemetry_enabled,
         }
+    }
+}
+
+// ---------- 能力集辅助 ----------
+
+/// 控件不可用时的说明。`None` = 还没拿到能力集。
+fn caps_note(available: Option<bool>) -> &'static str {
+    match available {
+        None => "Capabilities not available",
+        Some(false) => "Not supported by this board",
+        Some(true) => "",
+    }
+}
+
+/// daemon 的 preset 名 -> GUI 显示名。只影响显示，不影响发出去的值。
+/// 认不出来的名字原样显示，绝不隐藏。
+fn preset_label(name: &str) -> String {
+    match name {
+        "full" => "Full".to_string(),
+        "high" => "High".to_string(),
+        "balanced" => "Balanced".to_string(),
+        "lifespan" => "Lifespan".to_string(),
+        "desk" => "Desk".to_string(),
+        "hold" => "Hold".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 只影响按钮顺序，未知档位排在最后但仍然显示。
+fn preset_rank(name: &str) -> u8 {
+    match name {
+        "full" => 0,
+        "high" => 1,
+        "balanced" => 2,
+        "lifespan" => 3,
+        "desk" => 4,
+        "hold" => 5,
+        _ => 99,
+    }
+}
+
+/// daemon 给的是 `(显示名, 意图)`，按 GUI 的习惯顺序排一下。
+fn sorted_presets(caps: &Capabilities) -> Vec<(String, ChargeIntent)> {
+    let mut list = caps.charge.presets.clone();
+    list.sort_by_key(|(name, _)| preset_rank(name));
+    list
+}
+
+/// 充电卡片的标签页。只有板子支持任意区间（`caps.charge.custom_range`）时才会出现。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChargeTab {
+    Presets,
+    Custom,
+}
+
+/// 当前意图是不是"不在 daemon preset 表里的自定义区间"。
+fn is_custom_intent(intent: ChargeIntent, presets: &[(String, ChargeIntent)]) -> bool {
+    matches!(intent, ChargeIntent::Preserve(Some(_)))
+        && !presets.iter().any(|(_, preset)| *preset == intent)
+}
+
+/// daemon 报的是自定义区间就停在 Custom 页，否则停在 Presets 页。
+fn charge_tab_for(intent: ChargeIntent, presets: &[(String, ChargeIntent)]) -> ChargeTab {
+    if is_custom_intent(intent, presets) {
+        ChargeTab::Custom
+    } else {
+        ChargeTab::Presets
+    }
+}
+
+/// 把一对 min/max 夹进板子允许的区间，并保证 `min < max`（daemon 会拒 `min >= max`）。
+/// 调用方需保证 `hi > lo + 1` —— Custom 页只在那种情况下才会出现。
+fn clamp_charge_range(min: u8, max: u8, lo: u8, hi: u8) -> (u8, u8) {
+    let mut min = min.clamp(lo, hi - 1);
+    let max = max.clamp(lo + 1, hi);
+    if min >= max {
+        min = (max - 1).max(lo);
+    }
+    (min, max)
+}
+
+/// Custom 页滑块的初值：draft 带区间就用它（和其他卡片一样反映 draft），
+/// 否则（`Full` / `Freeze` / `Preserve(None)`）用当前生效区间兜底。
+fn custom_seed(
+    draft: ChargeIntent,
+    current_min: Option<u8>,
+    current_max: Option<u8>,
+    lo: u8,
+    hi: u8,
+) -> (u8, u8) {
+    match draft {
+        ChargeIntent::Preserve(Some(r)) => clamp_charge_range(r.min, r.max, lo, hi),
+        _ => clamp_charge_range(current_min.unwrap_or(lo), current_max.unwrap_or(hi), lo, hi),
+    }
+}
+
+/// `(duty_max, available)` —— `None` = 能力集没拿到，`Some(false)` = 这块板子没这个风扇。
+fn fan_caps(caps: Option<&Capabilities>, index: FanIndex) -> (Option<u8>, Option<bool>) {
+    match caps {
+        None => (None, None),
+        Some(c) => match c.fans.iter().find(|f| f.index == index) {
+            Some(f) => (Some(f.duty_max), Some(true)),
+            None => (None, Some(false)),
+        },
+    }
+}
+
+fn fmt_charge_intent(intent: ChargeIntent) -> String {
+    match intent {
+        ChargeIntent::Full => "Full".to_string(),
+        ChargeIntent::Preserve(Some(range)) => format!("Preserve {}-{}%", range.min, range.max),
+        ChargeIntent::Preserve(None) => "Preserve (firmware)".to_string(),
+        ChargeIntent::Freeze => "Freeze".to_string(),
+    }
+}
+
+/// daemon 在 `UnsupportedHardware` 时把 message 写成空字符串，真正有用的是
+/// `unsupported.board` / `unsupported.chip`。空 message 时用它们拼一句，
+/// 其余情况原样显示 daemon 给的英文文案。
+fn fmt_ipc_error(err: &IpcError) -> String {
+    if !err.message.is_empty() {
+        return err.message.clone();
+    }
+    match &err.unsupported {
+        Some(info) => match &info.chip {
+            Some(chip) => format!("Unsupported board: {} (chip {})", info.board, chip),
+            None => format!("Unsupported board: {}", info.board),
+        },
+        None => format!("{:?}", err.code),
     }
 }
 
@@ -401,9 +513,18 @@ struct LecooApp {
     ec_revision: String,
     connected: bool,
 
+    /// 连接后拉一次能力集；断连时清空，重连后重新拉。
+    caps: Option<Capabilities>,
+    /// 能力集拉取失败的原因。有值时不再重试，避免每个刷新周期刷屏。
+    caps_error: Option<String>,
+
     current: CurrentSettings,
     draft: AppDraft,
     metrics: LiveMetrics,
+    /// `ChargeStatus.pending`：daemon 给的英文原文，意图已记下但尚未生效。
+    charge_pending: Option<String>,
+    /// 充电卡片的标签页（Presets / Custom），只有支持任意区间的板子才用得上。
+    charge_tab: ChargeTab,
 
     refresh_rate: RefreshRate,
     last_refresh: Instant,
@@ -442,9 +563,13 @@ impl LecooApp {
             ec_chip: String::new(),
             ec_revision: String::new(),
             connected: false,
+            caps: None,
+            caps_error: None,
             current,
             draft,
             metrics: LiveMetrics::default(),
+            charge_pending: None,
+            charge_tab: ChargeTab::Presets,
             refresh_rate: RefreshRate::default(),
             last_refresh: Instant::now() - Duration::from_secs(5),
             status: "Connecting...".to_string(),
@@ -469,9 +594,12 @@ impl LecooApp {
         std::thread::Builder::new()
             .name("battery-info-worker".into())
             .spawn(move || {
+                // WMI 连接建一次就复用。原来每轮都重建最多 4 套 COM/WMI 连接，
+                // 既拖慢首轮（Health/Power 长时间显示占位符），也每 15 秒白做一次。
+                let wmi = BatteryWmi::new();
                 loop {
-                    let status = read_power_source_windows();
-                    let health = read_battery_health_windows();
+                    let status = read_power_source_windows(&wmi);
+                    let health = read_battery_health_windows(&wmi);
                     if tx.send((status, health)).is_err() {
                         break;
                     }
@@ -511,6 +639,8 @@ impl LecooApp {
         if !is_service_running("LecooControlDaemon") {
             self.client = None;
             self.connected = false;
+            self.caps = None;
+            self.caps_error = None;
             self.status = "Disconnected".to_string();
             self.daemon_version = "unknown".to_string();
             self.ec_chip.clear();
@@ -529,12 +659,57 @@ impl LecooApp {
             Err(err) => {
                 self.client = None;
                 self.connected = false;
+                self.caps = None;
+                self.caps_error = None;
                 Err(err.to_string())
             }
         }
     }
 
+    /// 拉一次能力集。传输层失败就保持 `None`，下次 refresh 再试；
+    /// 但如果是 daemon 明确拒绝（板子未识别 / 请求不认识），就记下原因不再重试。
+    fn fetch_capabilities(&mut self) {
+        if self.caps.is_some() || self.caps_error.is_some() {
+            return;
+        }
+
+        match self.request(&IpcRequest::DaemonCommand(DaemonCommand::GetCapabilities)) {
+            Ok(IpcResponse::Capabilities(caps)) => {
+                self.caps = Some(*caps);
+                self.caps_error = None;
+            }
+            Ok(IpcResponse::Error(err)) => {
+                let msg = fmt_ipc_error(&err);
+                self.set_notice(
+                    &msg,
+                    NoticeLevel::Error,
+                    Some(Duration::from_secs(NOTICE_TTL_SECS)),
+                );
+                self.caps_error = Some(msg);
+            }
+            Ok(other) => {
+                let msg = format!("Unexpected GetCapabilities response: {other:?}");
+                self.set_notice(
+                    &msg,
+                    NoticeLevel::Error,
+                    Some(Duration::from_secs(NOTICE_TTL_SECS)),
+                );
+                self.caps_error = Some(msg);
+            }
+            // 传输层错误：上面的 request 已经把连接清掉了，不记原因，等重连后再试。
+            Err(err) => {
+                self.caps = None;
+                self.caps_error = None;
+                self.last_error = Some(err);
+            }
+        }
+    }
+
     fn refresh_data(&mut self, force_sync_draft: bool) -> Result<(), String> {
+        if self.caps.is_none() {
+            self.fetch_capabilities();
+        }
+
         if let IpcResponse::SystemInfo(info) = self.request(&IpcRequest::GetSystemState)? {
             self.ec_chip = info.chip;
             self.ec_revision = info.revision;
@@ -553,12 +728,12 @@ impl LecooApp {
             self.metrics.gpu_rpm = Some(gpu);
         }
 
-        if let IpcResponse::ChargeLimit { min, max, current } =
-            self.request(&IpcRequest::GetChargeLimit)?
-        {
-            self.metrics.charge_min = Some(min);
-            self.metrics.charge_max = Some(max);
-            self.metrics.battery_percent = Some(current);
+        if let IpcResponse::ChargeStatus(status) = self.request(&IpcRequest::GetChargeStatus)? {
+            self.metrics.charge_min = status.thresholds.map(|t| t.0);
+            self.metrics.charge_max = status.thresholds.map(|t| t.1);
+            self.metrics.battery_percent = Some(status.soc);
+            // daemon 给的英文原文，直接显示。
+            self.charge_pending = status.pending;
         }
 
         let settings_resp = self.request(&IpcRequest::DaemonCommand(DaemonCommand::GetSettings))?;
@@ -568,6 +743,13 @@ impl LecooApp {
             if force_sync_draft || !self.has_pending_changes() {
                 self.draft = AppDraft::from(settings);
                 self.sync_led_ui_from_mode(self.draft.led_mode);
+            }
+            if force_sync_draft {
+                // 只在"重新从 daemon 读一遍"时对齐标签页（启动 / 应用后 / 重连 / 手动读取）。
+                // 周期刷新绝不能碰它：否则用户点了 Custom 但还没拖滑块时（draft == current，
+                // 没有待应用改动），会被每个刷新周期踢回 Presets 页。
+                let presets = self.caps.as_ref().map(sorted_presets).unwrap_or_default();
+                self.charge_tab = charge_tab_for(self.draft.charge_intent, &presets);
             }
         }
 
@@ -605,7 +787,7 @@ impl LecooApp {
         if self.draft.fan_mode_gpu != self.current.fan_mode_gpu {
             count += 1;
         }
-        if charge_limit_from_intent(self.current.charge) != Some(self.draft.charge_limit) {
+        if self.draft.charge_intent != self.current.charge {
             count += 1;
         }
         if self.draft.led_mode != self.current.led_mode {
@@ -668,13 +850,13 @@ impl LecooApp {
             errors.push(format!("GPU fan mode: {}", err));
         }
 
-        if charge_limit_from_intent(self.current.charge) != Some(self.draft.charge_limit)
+        if self.draft.charge_intent != self.current.charge
             && let Err(err) = self.request_action(
-                "Set charge limit",
-                &IpcRequest::SetChargeLimit(self.draft.charge_limit),
+                "Set charge intent",
+                &IpcRequest::SetChargeIntent(self.draft.charge_intent),
             )
         {
-            errors.push(format!("Charge limit: {}", err));
+            errors.push(format!("Charge intent: {}", err));
         }
 
         if self.draft.led_mode != self.current.led_mode
@@ -832,6 +1014,8 @@ impl LecooApp {
         // Service is running, perform normal reconnect
         self.client = None;
         self.connected = false;
+        self.caps = None;
+        self.caps_error = None;
         self.status = "Reconnecting...".to_string();
 		self.ensure_connected();
 
@@ -911,7 +1095,7 @@ impl LecooApp {
         match self.request(request)? {
             IpcResponse::Success => Ok(()),
             IpcResponse::TelemetryDisabledInfo => Ok(()),
-            IpcResponse::Error(err) => Err(err.message),
+            IpcResponse::Error(err) => Err(fmt_ipc_error(&err)),
             other => Err(format!("Unexpected response: {:?}", other)),
         }
     }
@@ -954,6 +1138,7 @@ impl LecooApp {
             0 => 120.0, // Monitoring card has a second column for battery health + power source.
             2 => 150.0, // Fan card needs extra space for two editors + sliders.
             4 => 120.0, // Power LED card needs space for breathing presets + Advanced panel
+            5 => 130.0, // Charge card: two info labels + Presets/Custom tabs + buttons or sliders
             _ => 80.0,
         }
     }
@@ -996,38 +1181,44 @@ impl LecooApp {
                 });
             }
             1 => {
+                let profiles: Option<Vec<PowerProfile>> =
+                    self.caps.as_ref().map(|c| c.power_profiles.clone());
+                let profiles_available = profiles.as_ref().map(|p| !p.is_empty());
                 render_fixed_card(ui, card_height, "Power Profile", |ui| {
                     ui.label(format!(
                         "Current: {}",
                         fmt_power_profile(self.current.power_profile)
                     ));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(
-                            &mut self.draft.power_profile,
-                            PowerProfile::Silent,
-                            "Silent",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.power_profile,
-                            PowerProfile::Default,
-                            "Default",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.power_profile,
-                            PowerProfile::Performance,
-                            "Performance",
-                        );
+                    ui.add_enabled_ui(profiles_available == Some(true), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(list) = &profiles {
+                                for profile in list {
+                                    ui.selectable_value(
+                                        &mut self.draft.power_profile,
+                                        *profile,
+                                        fmt_power_profile(*profile),
+                                    );
+                                }
+                            }
+                        });
                     });
+                    if profiles_available != Some(true) {
+                        ui.label(caps_note(profiles_available));
+                    }
                     render_sync_state(ui, self.draft.power_profile == self.current.power_profile);
                 });
             }
             2 => {
+                let (cpu_duty, cpu_avail) = fan_caps(self.caps.as_ref(), FanIndex::Cpu);
+                let (gpu_duty, gpu_avail) = fan_caps(self.caps.as_ref(), FanIndex::Gpu);
                 render_fixed_card(ui, card_height, "Fan Control", |ui| {
                     fan_editor(
                         ui,
                         "CPU",
                         self.current.fan_mode_cpu,
                         &mut self.draft.fan_mode_cpu,
+                        cpu_duty,
+                        caps_note(cpu_avail),
                     );
                     ui.separator();
                     fan_editor(
@@ -1035,6 +1226,8 @@ impl LecooApp {
                         "GPU",
                         self.current.fan_mode_gpu,
                         &mut self.draft.fan_mode_gpu,
+                        gpu_duty,
+                        caps_note(gpu_avail),
                     );
                     render_sync_state(
                         ui,
@@ -1044,33 +1237,40 @@ impl LecooApp {
                 });
             }
             3 => {
+                // 注意：KbdCaps 的 levels/custom 目前恒为 true，只有 on_off 可信。
+                let kbd_available = self.caps.as_ref().map(|c| c.kbd.on_off);
                 render_fixed_card(ui, card_height, "Keyboard Backlight", |ui| {
                     ui.label(format!(
                         "Current: {}",
                         fmt_kbd(self.current.keyboard_backlight)
                     ));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(
-                            &mut self.draft.keyboard_backlight,
-                            KeyboardBacklightLevel::Off,
-                            "0",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.keyboard_backlight,
-                            KeyboardBacklightLevel::Low,
-                            "1",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.keyboard_backlight,
-                            KeyboardBacklightLevel::Medium,
-                            "2",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.keyboard_backlight,
-                            KeyboardBacklightLevel::High,
-                            "3",
-                        );
+                    ui.add_enabled_ui(kbd_available == Some(true), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut self.draft.keyboard_backlight,
+                                KeyboardBacklightLevel::Off,
+                                "0",
+                            );
+                            ui.selectable_value(
+                                &mut self.draft.keyboard_backlight,
+                                KeyboardBacklightLevel::Low,
+                                "1",
+                            );
+                            ui.selectable_value(
+                                &mut self.draft.keyboard_backlight,
+                                KeyboardBacklightLevel::Medium,
+                                "2",
+                            );
+                            ui.selectable_value(
+                                &mut self.draft.keyboard_backlight,
+                                KeyboardBacklightLevel::High,
+                                "3",
+                            );
+                        });
                     });
+                    if kbd_available != Some(true) {
+                        ui.label(caps_note(kbd_available));
+                    }
                     render_sync_state(
                         ui,
                         self.draft.keyboard_backlight == self.current.keyboard_backlight,
@@ -1078,6 +1278,12 @@ impl LecooApp {
                 });
             }
             4 => {
+                let led_available = self.caps.as_ref().map(|c| c.led.on_off);
+                let led_enabled = led_available == Some(true);
+                let brightness_enabled =
+                    led_enabled && self.caps.as_ref().map(|c| c.led.brightness).unwrap_or(false);
+                let animation_enabled =
+                    led_enabled && self.caps.as_ref().map(|c| c.led.animation).unwrap_or(false);
                 render_fixed_card(ui, card_height, "Power LED", |ui| {
                     ui.label(format!("Current: {}", fmt_led_mode(self.current.led_mode)));
 
@@ -1088,33 +1294,45 @@ impl LecooApp {
 
                     ui.horizontal(|ui| {
                         let auto_selected = matches!(self.draft.led_mode, PowerLedMode::Auto);
-                        if ui.selectable_label(auto_selected, "Auto").clicked() {
-                            self.draft.led_mode = PowerLedMode::Auto;
-                        }
+                        ui.add_enabled_ui(led_enabled, |ui| {
+                            if ui.selectable_label(auto_selected, "Auto").clicked() {
+                                self.draft.led_mode = PowerLedMode::Auto;
+                            }
+                        });
 
                         let custom_selected =
                             matches!(self.draft.led_mode, PowerLedMode::Custom(_));
-                        if ui.selectable_label(custom_selected, "Custom").clicked() {
-                            self.draft.led_mode = PowerLedMode::Custom(led_custom);
-                        }
+                        ui.add_enabled_ui(brightness_enabled, |ui| {
+                            if ui.selectable_label(custom_selected, "Custom").clicked() {
+                                self.draft.led_mode = PowerLedMode::Custom(led_custom);
+                            }
+                        });
 
                         let breathing_selected =
                             matches!(self.draft.led_mode, PowerLedMode::Animation(_));
-                        if ui
-                            .selectable_label(breathing_selected, "Breathing")
-                            .clicked()
-                        {
-                            let config = self.led_breathing_preset.to_breath_config();
-                            self.led_step_up = config.step_up;
-                            self.led_step_down = config.step_down;
-                            self.led_delay_at_max = config.delay_at_max;
-                            self.led_delay_at_min = config.delay_at_min;
-                            self.draft.led_mode = PowerLedMode::Animation(config);
-                        }
+                        ui.add_enabled_ui(animation_enabled, |ui| {
+                            if ui
+                                .selectable_label(breathing_selected, "Breathing")
+                                .clicked()
+                            {
+                                let config = self.led_breathing_preset.to_breath_config();
+                                self.led_step_up = config.step_up;
+                                self.led_step_down = config.step_down;
+                                self.led_delay_at_max = config.delay_at_max;
+                                self.led_delay_at_min = config.delay_at_min;
+                                self.draft.led_mode = PowerLedMode::Animation(config);
+                            }
+                        });
                     });
 
+                    if !led_enabled {
+                        ui.label(caps_note(led_available));
+                    } else if !animation_enabled {
+                        ui.small("Breathing not supported by this board");
+                    }
+
                     let custom_active = matches!(self.draft.led_mode, PowerLedMode::Custom(_));
-                    ui.add_enabled_ui(custom_active, |ui| {
+                    ui.add_enabled_ui(custom_active && brightness_enabled, |ui| {
                         if ui
                             .add(egui::Slider::new(&mut led_custom, 0..=255).text("Brightness"))
                             .changed()
@@ -1129,7 +1347,7 @@ impl LecooApp {
 
                     let breathing_active =
                         matches!(self.draft.led_mode, PowerLedMode::Animation(_));
-                    ui.add_enabled_ui(breathing_active, |ui| {
+                    ui.add_enabled_ui(breathing_active && animation_enabled, |ui| {
                         let previous_preset = self.led_breathing_preset;
                         egui::ComboBox::from_id_salt("breathing_preset")
                             .selected_text(self.led_breathing_preset.label())
@@ -1372,48 +1590,133 @@ impl LecooApp {
                 });
             }
             5 => {
+                // 档位完全由 daemon 的 presets 决定：有几档画几个按钮，
+                // 点下去存的是 daemon 给的 ChargeIntent，发出时原样发回。
+                let charge_available = self.caps.as_ref().map(|c| c.charge.supported);
+                let charge_enabled = charge_available == Some(true);
+                let charge_presets = self.caps.as_ref().map(sorted_presets).unwrap_or_default();
+                // 只有板子真的支持任意区间、且区间至少能装下两个不同值时才给 Custom 页。
+                let custom_bounds = self
+                    .caps
+                    .as_ref()
+                    .and_then(|c| c.charge.custom_range)
+                    .filter(|(lo, hi)| *hi > lo.saturating_add(1));
+                // 当前意图优先用 daemon 的 preset 名显示（N155A 上就是 "Balanced"），
+                // 匹配不到任何 preset 时才退回通用格式（自定义区间会走到这里）。
+                let current_charge_label = charge_presets
+                    .iter()
+                    .find(|(_, intent)| *intent == self.current.charge)
+                    .map(|(name, _)| preset_label(name))
+                    .unwrap_or_else(|| fmt_charge_intent(self.current.charge));
+
                 render_fixed_card(ui, card_height, "Battery Charge Limit", |ui| {
-                    ui.label(format!(
-                        "Current profile: {}",
-                        fmt_charge_intent(self.current.charge)
-                    ));
+                    ui.label(format!("Current profile: {}", current_charge_label));
                     ui.label(format!(
                         "Current range: {}-{}%",
                         fmt_opt_u8(self.metrics.charge_min),
                         fmt_opt_u8(self.metrics.charge_max)
                     ));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(
-                            &mut self.draft.charge_limit,
-                            ChargeLimit::FullCapacity,
-                            "Full",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.charge_limit,
-                            ChargeLimit::HighCapacity,
-                            "High",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.charge_limit,
-                            ChargeLimit::Balanced,
-                            "Balanced",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.charge_limit,
-                            ChargeLimit::MaximumLifespan,
-                            "Lifespan",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.charge_limit,
-                            ChargeLimit::DeskMode,
-                            "Desk",
-                        );
+
+                    // 板子不支持任意区间就不画标签页，直接就是 preset 按钮行。
+                    // 点标签本身会写进 draft，所以底栏的 Pending changes、Apply all 的
+                    // 可用状态、卡片里的同步指示都会立刻跟着变（和 LED 卡片一致）。
+                    if charge_enabled && let Some((lo, hi)) = custom_bounds {
+                        ui.horizontal(|ui| {
+                            let on_presets = self.charge_tab == ChargeTab::Presets;
+                            if ui.selectable_label(on_presets, "Presets").clicked() && !on_presets {
+                                self.charge_tab = ChargeTab::Presets;
+                                // 能回到 daemon 报的那个预设就回它（等于没有改动），
+                                // 否则退回档位表第一项。
+                                let rollback =
+                                    charge_presets.iter().any(|(_, i)| *i == self.current.charge);
+                                let target = if rollback {
+                                    Some(self.current.charge)
+                                } else {
+                                    charge_presets.first().map(|(_, i)| *i)
+                                };
+                                if let Some(intent) = target {
+                                    self.draft.charge_intent = intent;
+                                }
+                            }
+
+                            let on_custom = self.charge_tab == ChargeTab::Custom;
+                            if ui.selectable_label(on_custom, "Custom").clicked() && !on_custom {
+                                self.charge_tab = ChargeTab::Custom;
+                                let (min, max) = custom_seed(
+                                    self.draft.charge_intent,
+                                    self.metrics.charge_min,
+                                    self.metrics.charge_max,
+                                    lo,
+                                    hi,
+                                );
+                                self.draft.charge_intent =
+                                    ChargeIntent::Preserve(Some(ChargeRange { min, max }));
+                            }
+                        });
+                    }
+
+                    ui.add_enabled_ui(charge_enabled, |ui| {
+                        match custom_bounds {
+                            Some((lo, hi)) if self.charge_tab == ChargeTab::Custom => {
+                                // 和其他卡片一样，滑块始终反映 draft。
+                                let (mut min, mut max) = custom_seed(
+                                    self.draft.charge_intent,
+                                    self.metrics.charge_min,
+                                    self.metrics.charge_max,
+                                    lo,
+                                    hi,
+                                );
+
+                                // egui 的 Slider 默认只用 slider_width(100) 宽，右边会空一大片。
+                                // 减去数值框 + "Min"/"Max" 标签占的余量，把轨道拉到卡片宽度。
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 100.0).max(80.0);
+
+                                // 两个滑块竖着放（上下各一条），标签在各自右侧
+                                let mut changed = false;
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut min, lo..=(hi - 1)).text("Min"))
+                                    .changed();
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut max, (lo + 1)..=hi).text("Max"))
+                                    .changed();
+                                if min >= max {
+                                    min = (max - 1).max(lo);
+                                    changed = true;
+                                }
+                                ui.small(format!(
+                                    "Custom: {min}-{max}%  (board allows {lo}-{hi}%)"
+                                ));
+                                if changed {
+                                    self.draft.charge_intent =
+                                        ChargeIntent::Preserve(Some(ChargeRange { min, max }));
+                                }
+                            }
+                            _ => {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (name, intent) in &charge_presets {
+                                        ui.selectable_value(
+                                            &mut self.draft.charge_intent,
+                                            *intent,
+                                            preset_label(name),
+                                        );
+                                    }
+                                });
+                                if charge_presets.is_empty() {
+                                    ui.small("No presets reported by this daemon");
+                                }
+                            }
+                        }
                     });
-                    render_sync_state(
-                        ui,
-                        charge_limit_from_intent(self.current.charge)
-                            == Some(self.draft.charge_limit),
-                    );
+
+                    if !charge_enabled {
+                        ui.label(caps_note(charge_available));
+                    }
+                    // daemon 给的英文原文，直接显示。
+                    if let Some(reason) = &self.charge_pending {
+                        ui.small(format!("Pending: {reason}"));
+                    }
+                    render_sync_state(ui, self.draft.charge_intent == self.current.charge);
                 });
             }
             6 => {
@@ -1722,13 +2025,15 @@ fn fmt_opt_u16(v: Option<u16>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
+/// 这两项走 WMI，比 IPC 慢，启动后有一小段时间还没有值。
+/// 用 "…" 表示"正在读"，避免和"这块板子没有这项数据"混淆。
 fn fmt_battery_health(v: Option<u8>) -> String {
     v.map(|n| format!("{}%", n))
-        .unwrap_or_else(|| "N/A".to_string())
+        .unwrap_or_else(|| "…".to_string())
 }
 
 fn fmt_power_source(v: Option<PowerSourceStatus>) -> &'static str {
-    v.map(|p| p.label()).unwrap_or("N/A")
+    v.map(|p| p.label()).unwrap_or("…")
 }
 
 #[cfg(target_os = "windows")]
@@ -1750,8 +2055,54 @@ fn activate_existing_window() -> bool {
     }
     false
 }
+/// 一次性建好、循环复用的 WMI 连接。
+/// `WMIConnection::with_namespace_path` 会消费 `COMLibrary`，所以每个命名空间
+/// 各持有一个连接。
 #[cfg(target_os = "windows")]
-fn read_power_source_windows() -> Option<PowerSourceStatus> {
+struct BatteryWmi {
+    /// `ROOT\wmi`：`BatteryStatus` / `BatteryStaticData` 等类都在这个命名空间。
+    root_wmi: Option<WMIConnection>,
+    /// `ROOT\CIMV2`：只在 `ROOT\wmi` 查不到时才连。绝大多数机器用不上它，
+    /// 所以做成懒加载，免得启动时白等一次 WMI 连接建立。
+    cimv2: OnceCell<Option<WMIConnection>>,
+}
+
+#[cfg(target_os = "windows")]
+impl BatteryWmi {
+    fn new() -> Self {
+        let root_wmi = COMLibrary::new()
+            .ok()
+            .and_then(|com| WMIConnection::with_namespace_path("ROOT\\wmi", com).ok());
+        Self {
+            root_wmi,
+            cimv2: OnceCell::new(),
+        }
+    }
+
+    /// 回退连接，第一次真正用到时才建立。
+    fn cimv2(&self) -> Option<&WMIConnection> {
+        self.cimv2
+            .get_or_init(|| {
+                COMLibrary::new()
+                    .ok()
+                    .and_then(|com| WMIConnection::with_namespace_path("ROOT\\CIMV2", com).ok())
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+struct BatteryWmi;
+
+#[cfg(not(target_os = "windows"))]
+impl BatteryWmi {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_power_source_windows(wmi: &BatteryWmi) -> Option<PowerSourceStatus> {
     #[derive(Deserialize, Debug)]
     struct BatteryStatus {
         #[serde(rename = "ChargeRate")]
@@ -1778,51 +2129,47 @@ fn read_power_source_windows() -> Option<PowerSourceStatus> {
     if status.ACLineStatus == 0 {
         return Some(PowerSourceStatus::Discharging);
     }
-    if status.ACLineStatus == 1 {
-        if let Ok(com_lib) = COMLibrary::new() {
-            if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\wmi", com_lib) {
-                let results =
-                    wmi_con.raw_query::<BatteryStatus>("SELECT ChargeRate FROM BatteryStatus");
-                if let Ok(mut results) = results {
-                    if let Some(bat) = results.pop() {
-                        if let Some(charge_rate) = bat.charge_rate {
-                            if charge_rate == 0 {
-                                return Some(PowerSourceStatus::Ac);
-                            } else {
-                                return Some(PowerSourceStatus::Charging);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Ok(com_lib) = COMLibrary::new() {
-            if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\CIMV2", com_lib) {
-                let results =
-                    wmi_con.raw_query::<Win32Battery>("SELECT BatteryStatus FROM Win32_Battery");
-                if let Ok(mut results) = results {
-                    if let Some(bat) = results.pop() {
-                        match bat.battery_status {
-                            Some(2) => return Some(PowerSourceStatus::Charging),
-                            Some(3) => return Some(PowerSourceStatus::Ac),
-                            Some(1) => return Some(PowerSourceStatus::Discharging),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        return Some(PowerSourceStatus::Ac);
+    if status.ACLineStatus != 1 {
+        return Some(PowerSourceStatus::Unknown);
     }
+
+    // AC 在线：再问 WMI 到底是在充电还是已经充满。
+    if let Some(con) = &wmi.root_wmi
+        && let Ok(mut results) =
+            con.raw_query::<BatteryStatus>("SELECT ChargeRate FROM BatteryStatus")
+        && let Some(charge_rate) = results.pop().and_then(|b| b.charge_rate)
+    {
+        return Some(if charge_rate == 0 {
+            PowerSourceStatus::Ac
+        } else {
+            PowerSourceStatus::Charging
+        });
+    }
+
+    if let Some(con) = wmi.cimv2()
+        && let Ok(mut results) =
+            con.raw_query::<Win32Battery>("SELECT BatteryStatus FROM Win32_Battery")
+        && let Some(bat) = results.pop()
+    {
+        match bat.battery_status {
+            Some(2) => return Some(PowerSourceStatus::Charging),
+            Some(3) => return Some(PowerSourceStatus::Ac),
+            Some(1) => return Some(PowerSourceStatus::Discharging),
+            _ => {}
+        }
+    }
+
+    // 查不到就老实说不知道。以前这里无条件 return Some(Ac)，
+    // 结果是 WMI 一失败就永远显示 "AC"，哪怕电池正在充电。
     Some(PowerSourceStatus::Unknown)
 }
 #[cfg(not(target_os = "windows"))]
-fn read_power_source_windows() -> Option<PowerSourceStatus> {
+fn read_power_source_windows(_wmi: &BatteryWmi) -> Option<PowerSourceStatus> {
     None
 }
 
 #[cfg(target_os = "windows")]
-fn read_battery_health_windows() -> Option<u8> {
+fn read_battery_health_windows(wmi: &BatteryWmi) -> Option<u8> {
     #[derive(Deserialize, Debug)]
     struct BatteryStaticData {
         #[serde(rename = "DesignedCapacity")]
@@ -1840,49 +2187,44 @@ fn read_battery_health_windows() -> Option<u8> {
         #[serde(rename = "FullChargeCapacity")]
         full_charge_capacity: Option<u32>,
     }
-    if let Ok(com_lib) = COMLibrary::new() {
-        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\wmi", com_lib) {
-            let static_data = wmi_con
-                .raw_query::<BatteryStaticData>("SELECT DesignedCapacity FROM BatteryStaticData")
-                .ok()
-                .and_then(|mut v| v.pop().and_then(|d| d.designed_capacity));
-            let full_data = wmi_con
-                .raw_query::<BatteryFullChargedCapacity>(
-                    "SELECT FullChargedCapacity FROM BatteryFullChargedCapacity",
-                )
-                .ok()
-                .and_then(|mut v| v.pop().and_then(|d| d.full_charged_capacity));
-            if let (Some(designed), Some(full)) = (static_data, full_data) {
-                if designed > 0 {
-                    return Some(((full as f64 * 100.0 / designed as f64).round() as u8).min(100));
-                }
-            }
+
+    fn health(designed: u32, full: u32) -> Option<u8> {
+        (designed > 0).then(|| ((full as f64 * 100.0 / designed as f64).round() as u8).min(100))
+    }
+
+    if let Some(con) = &wmi.root_wmi {
+        let designed = con
+            .raw_query::<BatteryStaticData>("SELECT DesignedCapacity FROM BatteryStaticData")
+            .ok()
+            .and_then(|mut v| v.pop().and_then(|d| d.designed_capacity));
+        let full = con
+            .raw_query::<BatteryFullChargedCapacity>(
+                "SELECT FullChargedCapacity FROM BatteryFullChargedCapacity",
+            )
+            .ok()
+            .and_then(|mut v| v.pop().and_then(|d| d.full_charged_capacity));
+        if let (Some(designed), Some(full)) = (designed, full)
+            && let Some(h) = health(designed, full)
+        {
+            return Some(h);
         }
     }
-    if let Ok(com_lib) = COMLibrary::new() {
-        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\CIMV2", com_lib) {
-            if let Ok(mut v) = wmi_con.raw_query::<Win32Battery>(
-                "SELECT DesignCapacity, FullChargeCapacity FROM Win32_Battery",
-            ) {
-                if let Some(bat) = v.pop() {
-                    if let (Some(designed), Some(full)) =
-                        (bat.design_capacity, bat.full_charge_capacity)
-                    {
-                        if designed > 0 {
-                            return Some(
-                                ((full as f64 * 100.0 / designed as f64).round() as u8).min(100),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+
+    if let Some(con) = wmi.cimv2()
+        && let Ok(mut v) = con
+            .raw_query::<Win32Battery>("SELECT DesignCapacity, FullChargeCapacity FROM Win32_Battery")
+        && let Some(bat) = v.pop()
+        && let (Some(designed), Some(full)) = (bat.design_capacity, bat.full_charge_capacity)
+        && let Some(h) = health(designed, full)
+    {
+        return Some(h);
     }
+
     None
 }
 
 #[cfg(not(target_os = "windows"))]
-fn read_battery_health_windows() -> Option<u8> {
+fn read_battery_health_windows(_wmi: &BatteryWmi) -> Option<u8> {
     None
 }
 
@@ -1901,16 +2243,6 @@ fn fmt_kbd(level: KeyboardBacklightLevel) -> String {
         KeyboardBacklightLevel::Medium => "2".to_string(),
         KeyboardBacklightLevel::High => "3".to_string(),
         KeyboardBacklightLevel::Custom(u) => format!("Custom: {u}/255"),
-    }
-}
-
-fn fmt_charge_limit(limit: ChargeLimit) -> &'static str {
-    match limit {
-        ChargeLimit::FullCapacity => "Full",
-        ChargeLimit::HighCapacity => "High",
-        ChargeLimit::Balanced => "Balanced",
-        ChargeLimit::MaximumLifespan => "Lifespan",
-        ChargeLimit::DeskMode => "Desk",
     }
 }
 
@@ -1973,8 +2305,24 @@ fn render_fixed_card(
     });
 }
 
-fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanMode) {
+/// `duty_max` 来自能力集（不再硬编码 220）；拿不到时（未连接 / 该板子没这个风扇）
+/// 整个编辑器灰掉，并在 `note` 里说明原因。
+fn fan_editor(
+    ui: &mut egui::Ui,
+    title: &str,
+    current: FanMode,
+    draft: &mut FanMode,
+    duty_max: Option<u8>,
+    note: &str,
+) {
     ui.label(format!("{} current: {}", title, fmt_fan_mode(current)));
+
+    let Some(duty_max) = duty_max else {
+        ui.add_enabled_ui(false, |ui| {
+            ui.label(note);
+        });
+        return;
+    };
 
     let mut selected = match *draft {
         FanMode::Auto => 0,
@@ -1984,8 +2332,8 @@ fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanM
     };
 
     let mut custom_pwm = match *draft {
-        FanMode::Custom(v) => v.min(220),
-        _ => 128,
+        FanMode::Custom(v) => v.min(duty_max),
+        _ => 128.min(duty_max),
     };
 
     ui.horizontal(|ui| {
@@ -1996,8 +2344,8 @@ fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanM
     });
 
     ui.add_enabled_ui(selected == 3, |ui| {
-        ui.add(egui::Slider::new(&mut custom_pwm, 0..=220).text(format!("{} PWM", title)));
-        ui.small("Safe max: 220");
+        ui.add(egui::Slider::new(&mut custom_pwm, 0..=duty_max).text(format!("{} PWM", title)));
+        ui.small(format!("Safe max: {duty_max}"));
     });
 
     *draft = match selected {
