@@ -1719,6 +1719,7 @@ dependencies = [
  "chrono",
  "eframe",
  "ipc",
+ "lecoo-types",
  "serde",
  "serde_json",
  "single-instance",

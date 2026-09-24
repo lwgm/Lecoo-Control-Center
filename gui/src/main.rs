@@ -1,10 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 use chrono::Local;
 use eframe::egui;
-use ipc::{
-    BreathConfig, BreathDelay, BreathStep, ChargeLimit, CurrentSettings, DaemonCommand,
-    DaemonResponse, FanIndex, FanMode, IpcClient, IpcRequest, IpcResponse, KeyboardBacklightLevel,
-    PowerLedMode, PowerProfile,
+use ipc::{DaemonCommand, IpcClient, IpcRequest, IpcResponse};
+use lecoo_types::{
+    ec_types::{
+        BreathConfig, BreathDelay, BreathStep, ChargeIntent, ChargeLimit, FanIndex, FanMode,
+        KeyboardBacklightLevel, PowerLedMode, PowerProfile,
+    },
+    settings::CurrentSettings,
 };
 use single_instance::SingleInstance;
 use std::sync::Arc;
@@ -216,6 +219,26 @@ struct AppDraft {
     telemetry_enabled: bool,
 }
 
+/// Upstream replaced `CurrentSettings::charge_limit` with `ChargeIntent`.
+/// The GUI still exposes the five legacy presets, so map back where we can.
+fn charge_limit_from_intent(intent: ChargeIntent) -> Option<ChargeLimit> {
+    match intent {
+        ChargeIntent::Full => Some(ChargeLimit::FullCapacity),
+        ChargeIntent::Preserve(Some(range)) => ChargeLimit::from_predefined(range.min, range.max),
+        ChargeIntent::Preserve(None) | ChargeIntent::Freeze => None,
+    }
+}
+
+fn fmt_charge_intent(intent: ChargeIntent) -> &'static str {
+    match charge_limit_from_intent(intent) {
+        Some(limit) => fmt_charge_limit(limit),
+        None => match intent {
+            ChargeIntent::Freeze => "Frozen",
+            _ => "Custom",
+        },
+    }
+}
+
 impl From<CurrentSettings> for AppDraft {
     fn from(value: CurrentSettings) -> Self {
         Self {
@@ -223,7 +246,8 @@ impl From<CurrentSettings> for AppDraft {
             keyboard_backlight: value.keyboard_backlight,
             fan_mode_cpu: value.fan_mode_cpu,
             fan_mode_gpu: value.fan_mode_gpu,
-            charge_limit: value.charge_limit,
+            charge_limit: charge_limit_from_intent(value.charge)
+                .unwrap_or(ChargeLimit::FullCapacity),
             led_mode: value.led_mode,
             telemetry_enabled: value.telemetry_enabled,
         }
@@ -409,7 +433,7 @@ struct LecooApp {
 impl LecooApp {
     fn new() -> Self {
         let current = CurrentSettings::default();
-        let draft = AppDraft::from(current);
+        let draft = AppDraft::from(current.clone());
         let (tx, rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let mut app = Self {
@@ -468,8 +492,6 @@ impl LecooApp {
         }
         match IpcClient::connect() {
             Ok(client) => {
-                self.daemon_version =
-                    format!("{}.{}", client.daemon_version.0, client.daemon_version.1);
                 self.client = Some(client);
                 self.connected = true;
                 self.last_error = None;
@@ -513,24 +535,25 @@ impl LecooApp {
     }
 
     fn refresh_data(&mut self, force_sync_draft: bool) -> Result<(), String> {
-        if let IpcResponse::SystemInfo(chip, rev, _offset, _ver) =
-            self.request(&IpcRequest::GetSystemState)?
-        {
-            self.ec_chip = chip;
-            self.ec_revision = rev;
+        if let IpcResponse::SystemInfo(info) = self.request(&IpcRequest::GetSystemState)? {
+            self.ec_chip = info.chip;
+            self.ec_revision = info.revision;
+            if !info.daemon_version.is_empty() {
+                self.daemon_version = info.daemon_version;
+            }
         }
 
-        if let IpcResponse::Temp(cpu, sys) = self.request(&IpcRequest::GetTemperatures)? {
-            self.metrics.cpu_temp = Some(cpu);
-            self.metrics.sys_temp = Some(sys);
+        if let IpcResponse::Temps { cpu_c, sys_c } = self.request(&IpcRequest::GetTemperatures)? {
+            self.metrics.cpu_temp = Some(cpu_c);
+            self.metrics.sys_temp = Some(sys_c);
         }
 
-        if let IpcResponse::FanRPM(cpu, gpu) = self.request(&IpcRequest::GetFansRPM)? {
+        if let IpcResponse::FanRpm { cpu, gpu } = self.request(&IpcRequest::GetFansRPM)? {
             self.metrics.cpu_rpm = Some(cpu);
             self.metrics.gpu_rpm = Some(gpu);
         }
 
-        if let IpcResponse::ChargeLimit(min, max, current) =
+        if let IpcResponse::ChargeLimit { min, max, current } =
             self.request(&IpcRequest::GetChargeLimit)?
         {
             self.metrics.charge_min = Some(min);
@@ -539,8 +562,9 @@ impl LecooApp {
         }
 
         let settings_resp = self.request(&IpcRequest::DaemonCommand(DaemonCommand::GetSettings))?;
-        if let IpcResponse::DaemonResponse(DaemonResponse::Settings(settings)) = settings_resp {
-            self.current = settings;
+        if let IpcResponse::Settings(settings) = settings_resp {
+            let settings = *settings;
+            self.current = settings.clone();
             if force_sync_draft || !self.has_pending_changes() {
                 self.draft = AppDraft::from(settings);
                 self.sync_led_ui_from_mode(self.draft.led_mode);
@@ -581,7 +605,7 @@ impl LecooApp {
         if self.draft.fan_mode_gpu != self.current.fan_mode_gpu {
             count += 1;
         }
-        if self.draft.charge_limit != self.current.charge_limit {
+        if charge_limit_from_intent(self.current.charge) != Some(self.draft.charge_limit) {
             count += 1;
         }
         if self.draft.led_mode != self.current.led_mode {
@@ -644,7 +668,7 @@ impl LecooApp {
             errors.push(format!("GPU fan mode: {}", err));
         }
 
-        if self.draft.charge_limit != self.current.charge_limit
+        if charge_limit_from_intent(self.current.charge) != Some(self.draft.charge_limit)
             && let Err(err) = self.request_action(
                 "Set charge limit",
                 &IpcRequest::SetChargeLimit(self.draft.charge_limit),
@@ -887,7 +911,7 @@ impl LecooApp {
         match self.request(request)? {
             IpcResponse::Success => Ok(()),
             IpcResponse::TelemetryDisabledInfo => Ok(()),
-            IpcResponse::Error(err) => Err(err),
+            IpcResponse::Error(err) => Err(err.message),
             other => Err(format!("Unexpected response: {:?}", other)),
         }
     }
@@ -1351,7 +1375,7 @@ impl LecooApp {
                 render_fixed_card(ui, card_height, "Battery Charge Limit", |ui| {
                     ui.label(format!(
                         "Current profile: {}",
-                        fmt_charge_limit(self.current.charge_limit)
+                        fmt_charge_intent(self.current.charge)
                     ));
                     ui.label(format!(
                         "Current range: {}-{}%",
@@ -1385,7 +1409,11 @@ impl LecooApp {
                             "Desk",
                         );
                     });
-                    render_sync_state(ui, self.draft.charge_limit == self.current.charge_limit);
+                    render_sync_state(
+                        ui,
+                        charge_limit_from_intent(self.current.charge)
+                            == Some(self.draft.charge_limit),
+                    );
                 });
             }
             6 => {
@@ -1890,6 +1918,7 @@ fn fmt_fan_mode(mode: FanMode) -> String {
     match mode {
         FanMode::Auto => "Auto".to_string(),
         FanMode::Full => "Full".to_string(),
+        FanMode::Turbo => "Turbo".to_string(),
         FanMode::Custom(v) => format!("Custom ({})", v),
     }
 }
@@ -1950,7 +1979,8 @@ fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanM
     let mut selected = match *draft {
         FanMode::Auto => 0,
         FanMode::Full => 1,
-        FanMode::Custom(_) => 2,
+        FanMode::Turbo => 2,
+        FanMode::Custom(_) => 3,
     };
 
     let mut custom_pwm = match *draft {
@@ -1961,10 +1991,11 @@ fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanM
     ui.horizontal(|ui| {
         ui.radio_value(&mut selected, 0, "Auto");
         ui.radio_value(&mut selected, 1, "Full");
-        ui.radio_value(&mut selected, 2, "Custom");
+        ui.radio_value(&mut selected, 2, "Turbo");
+        ui.radio_value(&mut selected, 3, "Custom");
     });
 
-    ui.add_enabled_ui(selected == 2, |ui| {
+    ui.add_enabled_ui(selected == 3, |ui| {
         ui.add(egui::Slider::new(&mut custom_pwm, 0..=220).text(format!("{} PWM", title)));
         ui.small("Safe max: 220");
     });
@@ -1972,6 +2003,7 @@ fn fan_editor(ui: &mut egui::Ui, title: &str, current: FanMode, draft: &mut FanM
     *draft = match selected {
         0 => FanMode::Auto,
         1 => FanMode::Full,
+        2 => FanMode::Turbo,
         _ => FanMode::Custom(custom_pwm),
     };
 }
