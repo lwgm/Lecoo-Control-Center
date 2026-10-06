@@ -125,7 +125,7 @@ const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 450.0;
 const BATTERY_WORKER_INTERVAL_SECS: u64 = 15;
 const SERVICE_WAIT_TIMEOUT_SECS: u64 = 20;
-const UI_VERSION: &str = "0.3.0-beta1";
+const UI_VERSION: &str = "0.3.1-beta1";
 
 #[derive(Clone, Copy)]
 enum PowerSourceStatus {
@@ -282,26 +282,14 @@ fn sorted_presets(caps: &Capabilities) -> Vec<(String, ChargeIntent)> {
     list
 }
 
-/// 充电卡片的标签页。只有板子支持任意区间（`caps.charge.custom_range`）时才会出现。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChargeTab {
-    Presets,
-    Custom,
-}
-
 /// 当前意图是不是"不在 daemon preset 表里的自定义区间"。
+///
+/// 注意 `ChargeIntent` 的粒度：`Preserve(Some(r))` 同时覆盖"预设区间"和"自定义区间"，
+/// 例如 `Preserve(70,80)` 就是 balanced 预设本身。所以"是否展开自定义视图"这件事
+/// 不能只靠比较意图值来判断，得另有一个 `charge_custom_open` 描述界面状态。
 fn is_custom_intent(intent: ChargeIntent, presets: &[(String, ChargeIntent)]) -> bool {
     matches!(intent, ChargeIntent::Preserve(Some(_)))
         && !presets.iter().any(|(_, preset)| *preset == intent)
-}
-
-/// daemon 报的是自定义区间就停在 Custom 页，否则停在 Presets 页。
-fn charge_tab_for(intent: ChargeIntent, presets: &[(String, ChargeIntent)]) -> ChargeTab {
-    if is_custom_intent(intent, presets) {
-        ChargeTab::Custom
-    } else {
-        ChargeTab::Presets
-    }
 }
 
 /// 把一对 min/max 夹进板子允许的区间，并保证 `min < max`（daemon 会拒 `min >= max`）。
@@ -523,8 +511,9 @@ struct LecooApp {
     metrics: LiveMetrics,
     /// `ChargeStatus.pending`：daemon 给的英文原文，意图已记下但尚未生效。
     charge_pending: Option<String>,
-    /// 充电卡片的标签页（Presets / Custom），只有支持任意区间的板子才用得上。
-    charge_tab: ChargeTab,
+    /// 充电卡片的自定义区间视图是否展开（Custom 按钮的选中态）。
+    /// 只有板子支持任意区间（`caps.charge.custom_range`）时才会被置为 true。
+    charge_custom_open: bool,
 
     refresh_rate: RefreshRate,
     last_refresh: Instant,
@@ -569,7 +558,7 @@ impl LecooApp {
             draft,
             metrics: LiveMetrics::default(),
             charge_pending: None,
-            charge_tab: ChargeTab::Presets,
+            charge_custom_open: false,
             refresh_rate: RefreshRate::default(),
             last_refresh: Instant::now() - Duration::from_secs(5),
             status: "Connecting...".to_string(),
@@ -745,11 +734,12 @@ impl LecooApp {
                 self.sync_led_ui_from_mode(self.draft.led_mode);
             }
             if force_sync_draft {
-                // 只在"重新从 daemon 读一遍"时对齐标签页（启动 / 应用后 / 重连 / 手动读取）。
-                // 周期刷新绝不能碰它：否则用户点了 Custom 但还没拖滑块时（draft == current，
-                // 没有待应用改动），会被每个刷新周期踢回 Presets 页。
+                // 只在"重新从 daemon 读一遍"时决定自定义视图要不要展开
+                //（启动 / 应用后 / 重连 / 手动读取）。周期刷新不碰它：
+                // 否则用户刚点开 Custom 还没拖滑块时（draft == current，没有待应用改动），
+                // 会被每个刷新周期收起来。
                 let presets = self.caps.as_ref().map(sorted_presets).unwrap_or_default();
-                self.charge_tab = charge_tab_for(self.draft.charge_intent, &presets);
+                self.charge_custom_open = is_custom_intent(self.draft.charge_intent, &presets);
             }
         }
 
@@ -1595,7 +1585,7 @@ impl LecooApp {
                 let charge_available = self.caps.as_ref().map(|c| c.charge.supported);
                 let charge_enabled = charge_available == Some(true);
                 let charge_presets = self.caps.as_ref().map(sorted_presets).unwrap_or_default();
-                // 只有板子真的支持任意区间、且区间至少能装下两个不同值时才给 Custom 页。
+                // 只有板子真的支持任意区间、且区间至少能装下两个不同值时才给 Custom 按钮。
                 let custom_bounds = self
                     .caps
                     .as_ref()
@@ -1617,31 +1607,28 @@ impl LecooApp {
                         fmt_opt_u8(self.metrics.charge_max)
                     ));
 
-                    // 板子不支持任意区间就不画标签页，直接就是 preset 按钮行。
-                    // 点标签本身会写进 draft，所以底栏的 Pending changes、Apply all 的
-                    // 可用状态、卡片里的同步指示都会立刻跟着变（和 LED 卡片一致）。
-                    if charge_enabled && let Some((lo, hi)) = custom_bounds {
-                        ui.horizontal(|ui| {
-                            let on_presets = self.charge_tab == ChargeTab::Presets;
-                            if ui.selectable_label(on_presets, "Presets").clicked() && !on_presets {
-                                self.charge_tab = ChargeTab::Presets;
-                                // 能回到 daemon 报的那个预设就回它（等于没有改动），
-                                // 否则退回档位表第一项。
-                                let rollback =
-                                    charge_presets.iter().any(|(_, i)| *i == self.current.charge);
-                                let target = if rollback {
-                                    Some(self.current.charge)
-                                } else {
-                                    charge_presets.first().map(|(_, i)| *i)
-                                };
-                                if let Some(intent) = target {
-                                    self.draft.charge_intent = intent;
+                    // 预设按钮 + Custom 按钮排在同一行（Custom 只有板子支持任意区间时才出现）。
+                    // 点按钮会直接写进 draft，所以底栏的 Pending changes、Apply all 的可用状态、
+                    // 卡片里的同步指示都会立刻跟着变（和 LED 卡片的 Auto/Custom/Breathing 一致）。
+                    ui.add_enabled_ui(charge_enabled, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, intent) in &charge_presets {
+                                // 自定义视图展开时只让 Custom 高亮：自定义区间可能恰好等于
+                                // 某个预设（比如 Preserve(70,80) 就是 balanced），否则两个都会亮。
+                                let selected =
+                                    !self.charge_custom_open && self.draft.charge_intent == *intent;
+                                if ui.selectable_label(selected, preset_label(name)).clicked() {
+                                    self.charge_custom_open = false;
+                                    self.draft.charge_intent = *intent;
                                 }
                             }
 
-                            let on_custom = self.charge_tab == ChargeTab::Custom;
-                            if ui.selectable_label(on_custom, "Custom").clicked() && !on_custom {
-                                self.charge_tab = ChargeTab::Custom;
+                            if let Some((lo, hi)) = custom_bounds
+                                && ui.selectable_label(self.charge_custom_open, "Custom").clicked()
+                                && !self.charge_custom_open
+                            {
+                                // 展开并把 draft 填成种子区间；真正拖动滑块才算改动。
+                                self.charge_custom_open = true;
                                 let (min, max) = custom_seed(
                                     self.draft.charge_intent,
                                     self.metrics.charge_min,
@@ -1653,59 +1640,45 @@ impl LecooApp {
                                     ChargeIntent::Preserve(Some(ChargeRange { min, max }));
                             }
                         });
-                    }
 
-                    ui.add_enabled_ui(charge_enabled, |ui| {
-                        match custom_bounds {
-                            Some((lo, hi)) if self.charge_tab == ChargeTab::Custom => {
-                                // 和其他卡片一样，滑块始终反映 draft。
-                                let (mut min, mut max) = custom_seed(
-                                    self.draft.charge_intent,
-                                    self.metrics.charge_min,
-                                    self.metrics.charge_max,
-                                    lo,
-                                    hi,
-                                );
+                        // Custom 展开时，两条滑块显示在按钮行下面。
+                        if self.charge_custom_open
+                            && let Some((lo, hi)) = custom_bounds
+                        {
+                            // 和其他卡片一样，滑块始终反映 draft。
+                            let (mut min, mut max) = custom_seed(
+                                self.draft.charge_intent,
+                                self.metrics.charge_min,
+                                self.metrics.charge_max,
+                                lo,
+                                hi,
+                            );
 
-                                // egui 的 Slider 默认只用 slider_width(100) 宽，右边会空一大片。
-                                // 减去数值框 + "Min"/"Max" 标签占的余量，把轨道拉到卡片宽度。
-                                ui.spacing_mut().slider_width =
-                                    (ui.available_width() - 100.0).max(80.0);
+                            // egui 的 Slider 默认只用 slider_width(100) 宽，右边会空一大片。
+                            // 减去数值框 + "Min"/"Max" 标签占的余量，把轨道拉到卡片宽度。
+                            ui.spacing_mut().slider_width = (ui.available_width() - 100.0).max(80.0);
 
-                                // 两个滑块竖着放（上下各一条），标签在各自右侧
-                                let mut changed = false;
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut min, lo..=(hi - 1)).text("Min"))
-                                    .changed();
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut max, (lo + 1)..=hi).text("Max"))
-                                    .changed();
-                                if min >= max {
-                                    min = (max - 1).max(lo);
-                                    changed = true;
-                                }
-                                ui.small(format!(
-                                    "Custom: {min}-{max}%  (board allows {lo}-{hi}%)"
-                                ));
-                                if changed {
-                                    self.draft.charge_intent =
-                                        ChargeIntent::Preserve(Some(ChargeRange { min, max }));
-                                }
+                            // 两个滑块竖着放（上下各一条），标签在各自右侧
+                            let mut changed = false;
+                            changed |= ui
+                                .add(egui::Slider::new(&mut min, lo..=(hi - 1)).text("Min"))
+                                .changed();
+                            changed |= ui
+                                .add(egui::Slider::new(&mut max, (lo + 1)..=hi).text("Max"))
+                                .changed();
+                            if min >= max {
+                                min = (max - 1).max(lo);
+                                changed = true;
                             }
-                            _ => {
-                                ui.horizontal_wrapped(|ui| {
-                                    for (name, intent) in &charge_presets {
-                                        ui.selectable_value(
-                                            &mut self.draft.charge_intent,
-                                            *intent,
-                                            preset_label(name),
-                                        );
-                                    }
-                                });
-                                if charge_presets.is_empty() {
-                                    ui.small("No presets reported by this daemon");
-                                }
+                            ui.small(format!("Custom: {min}-{max}%  (board allows {lo}-{hi}%)"));
+                            if changed {
+                                self.draft.charge_intent =
+                                    ChargeIntent::Preserve(Some(ChargeRange { min, max }));
                             }
+                        }
+
+                        if charge_presets.is_empty() && custom_bounds.is_none() {
+                            ui.small("No presets reported by this daemon");
                         }
                     });
 
