@@ -125,7 +125,7 @@ const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 450.0;
 const BATTERY_WORKER_INTERVAL_SECS: u64 = 15;
 const SERVICE_WAIT_TIMEOUT_SECS: u64 = 20;
-const UI_VERSION: &str = "0.3.1-beta1";
+const UI_VERSION: &str = "0.3.2-beta1";
 
 #[derive(Clone, Copy)]
 enum PowerSourceStatus {
@@ -326,6 +326,44 @@ fn fan_caps(caps: Option<&Capabilities>, index: FanIndex) -> (Option<u8>, Option
             Some(f) => (Some(f.duty_max), Some(true)),
             None => (None, Some(false)),
         },
+    }
+}
+
+/// 充电区间显示（**"已选"口径**，用于 M1 展示）。
+///
+/// 区间优先从意图本身取 —— `Preserve(Some(range))` 自带 min/max，这是客户端点按钮
+/// 时就已经拿到的东西，不需要等 daemon 回报。只有 `Preserve(None)` / `Freeze`
+/// 这类意图本身不带数字的情况，才回落到 daemon 报回来的实际阈值。
+///
+/// `Full` 尤其不能去看寄存器值：FlexiCharger 用 `(0, 0)` 表示"不限制"
+/// （N155A 的 `full_max` 就是 `0`，daemon 的 `flexi::effective` 也正是靠
+/// `lo == 0 && hi == 0` 判定 Full 的），当百分比渲染就会显示成 "0-0%"。
+fn fmt_charge_range(intent: ChargeIntent, min: Option<u8>, max: Option<u8>) -> String {
+    match intent {
+        ChargeIntent::Full => "no limit".to_string(),
+        ChargeIntent::Preserve(Some(r)) => format!("{}-{}%", r.min, r.max),
+        ChargeIntent::Preserve(None) => match (min, max) {
+            (Some(lo), Some(hi)) => format!("{lo}-{hi}% (firmware)"),
+            _ => "firmware-managed".to_string(),
+        },
+        ChargeIntent::Freeze => match min {
+            Some(soc) => format!("held at {soc}%"),
+            None => "held at current".to_string(),
+        },
+    }
+}
+
+/// 预设按钮的悬停提示：这个档位对应的起停区间。
+///
+/// 按钮上只有名字（Desk / Lifespan…），看不出数字，所以补在这里。
+/// `Full` 本身没有阈值（FlexiCharger 写的是 `(0, 0)` 哨兵值表示不限制），
+/// 但用同一套"起停"记法反而更好懂：低端不限制，一直充到 100%。
+fn preset_tooltip(intent: ChargeIntent) -> String {
+    match intent {
+        ChargeIntent::Full => "start 0% · stop 100%".to_string(),
+        ChargeIntent::Preserve(Some(r)) => format!("start {}% · stop {}%", r.min, r.max),
+        ChargeIntent::Preserve(None) => "firmware-managed thresholds".to_string(),
+        ChargeIntent::Freeze => "hold at the current level".to_string(),
     }
 }
 
@@ -1591,21 +1629,24 @@ impl LecooApp {
                     .as_ref()
                     .and_then(|c| c.charge.custom_range)
                     .filter(|(lo, hi)| *hi > lo.saturating_add(1));
-                // 当前意图优先用 daemon 的 preset 名显示（N155A 上就是 "Balanced"），
-                // 匹配不到任何 preset 时才退回通用格式（自定义区间会走到这里）。
-                let current_charge_label = charge_presets
+                // M1 口径：这两行跟着 draft（"你选了什么"），不跟 current。
+                // 点按钮立刻变，就不会再有"点了像没点上"的感觉；有没有真正生效
+                // 由卡片底部的 Synced / Pending apply 表示。名字刻意不带 "Current"，
+                // 免得和"硬件当前值"混淆。
+                let selected_charge_label = charge_presets
                     .iter()
-                    .find(|(_, intent)| *intent == self.current.charge)
+                    .find(|(_, intent)| *intent == self.draft.charge_intent)
                     .map(|(name, _)| preset_label(name))
-                    .unwrap_or_else(|| fmt_charge_intent(self.current.charge));
+                    .unwrap_or_else(|| fmt_charge_intent(self.draft.charge_intent));
+                let selected_charge_range = fmt_charge_range(
+                    self.draft.charge_intent,
+                    self.metrics.charge_min,
+                    self.metrics.charge_max,
+                );
 
                 render_fixed_card(ui, card_height, "Battery Charge Limit", |ui| {
-                    ui.label(format!("Current profile: {}", current_charge_label));
-                    ui.label(format!(
-                        "Current range: {}-{}%",
-                        fmt_opt_u8(self.metrics.charge_min),
-                        fmt_opt_u8(self.metrics.charge_max)
-                    ));
+                    ui.label(format!("Profile: {selected_charge_label}"));
+                    ui.label(format!("Range: {selected_charge_range}"));
 
                     // 预设按钮 + Custom 按钮排在同一行（Custom 只有板子支持任意区间时才出现）。
                     // 点按钮会直接写进 draft，所以底栏的 Pending changes、Apply all 的可用状态、
@@ -1617,14 +1658,22 @@ impl LecooApp {
                                 // 某个预设（比如 Preserve(70,80) 就是 balanced），否则两个都会亮。
                                 let selected =
                                     !self.charge_custom_open && self.draft.charge_intent == *intent;
-                                if ui.selectable_label(selected, preset_label(name)).clicked() {
+                                // 悬停提示这个档位对应的具体范围
+                                if ui
+                                    .selectable_label(selected, preset_label(name))
+                                    .on_hover_text(preset_tooltip(*intent))
+                                    .clicked()
+                                {
                                     self.charge_custom_open = false;
                                     self.draft.charge_intent = *intent;
                                 }
                             }
 
                             if let Some((lo, hi)) = custom_bounds
-                                && ui.selectable_label(self.charge_custom_open, "Custom").clicked()
+                                && ui
+                                    .selectable_label(self.charge_custom_open, "Custom")
+                                    .on_hover_text(format!("custom range (board allows {lo}-{hi}%)"))
+                                    .clicked()
                                 && !self.charge_custom_open
                             {
                                 // 展开并把 draft 填成种子区间；真正拖动滑块才算改动。
