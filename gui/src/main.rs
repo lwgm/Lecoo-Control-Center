@@ -5,8 +5,8 @@ use ipc::{DaemonCommand, IpcClient, IpcError, IpcRequest, IpcResponse};
 use lecoo_types::{
     caps::Capabilities,
     ec_types::{
-        BreathConfig, BreathDelay, BreathStep, ChargeIntent, ChargeRange, FanIndex, FanMode,
-        KeyboardBacklightLevel, PowerLedMode, PowerProfile,
+        BatteryInfo, BreathConfig, BreathDelay, BreathStep, ChargeIntent, ChargeRange, FanIndex,
+        FanMode, KeyboardBacklightLevel, PowerLedMode, PowerProfile,
     },
     settings::CurrentSettings,
 };
@@ -125,7 +125,24 @@ const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 450.0;
 const BATTERY_WORKER_INTERVAL_SECS: u64 = 15;
 const SERVICE_WAIT_TIMEOUT_SECS: u64 = 20;
-const UI_VERSION: &str = "0.3.2-beta1";
+const UI_VERSION: &str = "0.4.0-beta1";
+
+/// 卡片总数。
+const CARD_COUNT: usize = 8;
+
+/// 网格里的摆放顺序（槽位 -> 卡片 id）。
+///
+/// `egui::Grid` 每行的高度取该行最高的那张卡片，所以"高配高、矮配矮"能省掉
+/// 大片空白。当前高度：Fan 150 / Battery 130 / Charge 130 / LED 120 / 其余 80。
+///
+/// 按 2 列排（600 逻辑宽度下的默认列数）：
+///   [Realtime Monitoring 80] [Power Profile      80]
+///   [Fan Control     150  ] [Battery          130]
+///   [Charge Limit    130  ] [Power LED        120]
+///   [Keyboard        80   ] [Advanced          80]
+///
+/// 窗口加宽到 3 列时配对会变，但顺序仍然是这个。
+const CARD_ORDER: [usize; CARD_COUNT] = [0, 1, 2, 7, 5, 4, 3, 6];
 
 #[derive(Clone, Copy)]
 enum PowerSourceStatus {
@@ -220,6 +237,8 @@ struct AppDraft {
     /// 直接持有 daemon 的 `ChargeIntent`，不再降级成本地枚举。
     charge_intent: ChargeIntent,
     led_mode: PowerLedMode,
+    /// 睡眠时 LED 环的表现（`DaemonCommand::SetLedOnSleep`）。
+    led_on_sleep: PowerLedMode,
     telemetry_enabled: bool,
 }
 
@@ -232,6 +251,7 @@ impl From<CurrentSettings> for AppDraft {
             fan_mode_gpu: value.fan_mode_gpu,
             charge_intent: value.charge,
             led_mode: value.led_mode,
+            led_on_sleep: value.led_on_sleep,
             telemetry_enabled: value.telemetry_enabled,
         }
     }
@@ -443,80 +463,28 @@ enum NoticeLevel {
     Error,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BreathingPreset {
-    Smooth,
-    Sleep,
-    Alert,
-    Zen,
-    Ping,
-    Energetic,
-    Warning,
-    Vacuum,
-    Panic,
-    Sonar,
-    Toxic,
+/// 默认的呼吸动画预设（取自上游 `BreathConfig::PRESETS` 里的名字）。
+const DEFAULT_BREATH_PRESET: &str = "smooth";
+
+/// 按名字取预设。上游以后在 `PRESETS` 里新增动画，GUI 不用改就能用上。
+fn breath_config_of(name: &str) -> BreathConfig {
+    BreathConfig::by_name(name).unwrap_or(BreathConfig::SMOOTH)
 }
 
-impl BreathingPreset {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Smooth => "Smooth",
-            Self::Sleep => "Sleep",
-            Self::Alert => "Alert",
-            Self::Zen => "Zen",
-            Self::Ping => "Ping",
-            Self::Energetic => "Energetic",
-            Self::Warning => "Warning",
-            Self::Vacuum => "Vacuum",
-            Self::Panic => "Panic",
-            Self::Sonar => "Sonar",
-            Self::Toxic => "Toxic",
-        }
-    }
-
-    fn to_breath_config(self) -> BreathConfig {
-        // 上游 0.6.0 把这批构造函数改成了同名的大写关联常量（`smooth()` -> `SMOOTH`）
-        match self {
-            Self::Smooth => BreathConfig::SMOOTH,
-            Self::Sleep => BreathConfig::SLEEP,
-            Self::Alert => BreathConfig::ALERT,
-            Self::Zen => BreathConfig::ZEN,
-            Self::Ping => BreathConfig::PING,
-            Self::Energetic => BreathConfig::ENERGETIC,
-            Self::Warning => BreathConfig::WARNING,
-            Self::Vacuum => BreathConfig::VACUUM,
-            Self::Panic => BreathConfig::PANIC,
-            Self::Sonar => BreathConfig::SONAR,
-            Self::Toxic => BreathConfig::TOXIC,
-        }
-    }
+/// 从配置反查预设名；手工调过参数就退回默认。
+/// 以前这里是一个 11 个变体的 `BreathingPreset` 枚举 + 手写的双向映射，
+/// 现在全部交给上游的 `PRESETS` / `by_name()` / `preset_name()`。
+fn breath_preset_of(config: BreathConfig) -> &'static str {
+    config.preset_name().unwrap_or(DEFAULT_BREATH_PRESET)
 }
 
-fn preset_from_breath_config(config: BreathConfig) -> BreathingPreset {
-    for preset in [
-        BreathingPreset::Smooth,
-        BreathingPreset::Sleep,
-        BreathingPreset::Alert,
-        BreathingPreset::Zen,
-        BreathingPreset::Ping,
-        BreathingPreset::Energetic,
-        BreathingPreset::Warning,
-        BreathingPreset::Vacuum,
-        BreathingPreset::Panic,
-        BreathingPreset::Sonar,
-        BreathingPreset::Toxic,
-    ] {
-        let base = preset.to_breath_config();
-        if base.max_brightness == config.max_brightness
-            && base.step_up == config.step_up
-            && base.step_down == config.step_down
-        {
-            return preset;
-        }
+/// "smooth" -> "Smooth"
+fn breath_label(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
-
-    BreathingPreset::Smooth
 }
 
 struct Notice {
@@ -553,6 +521,10 @@ struct LecooApp {
     /// 充电卡片的自定义区间视图是否展开（Custom 按钮的选中态）。
     /// 只有板子支持任意区间（`caps.charge.custom_range`）时才会被置为 true。
     charge_custom_open: bool,
+    /// daemon 指标样本里的运行时长（秒），目前只用于显示。
+    daemon_uptime_s: Option<u64>,
+    /// 电池详情（`GetBatteryInfo`）。板子不支持（`caps.battery_info == false`）时为 None。
+    battery: Option<BatteryInfo>,
 
     refresh_rate: RefreshRate,
     last_refresh: Instant,
@@ -561,8 +533,14 @@ struct LecooApp {
     last_error: Option<String>,
     notice: Option<Notice>,
     restore_defaults_confirm_open: bool,
-    led_breathing_preset: BreathingPreset,
+    led_breathing_preset: &'static str,
     led_breathing_advanced_open: bool,
+    /// LED 卡片的"睡眠时"编辑区是否展开
+    led_sleep_open: bool,
+    /// 睡眠灯效选 Fixed 亮度时用的值
+    led_sleep_custom: u8,
+    /// 睡眠灯效选呼吸动画时用的预设名
+    led_sleep_breathing_preset: &'static str,
     led_step_up: BreathStep,
     led_step_down: BreathStep,
     led_delay_at_max: BreathDelay,
@@ -598,14 +576,19 @@ impl LecooApp {
             metrics: LiveMetrics::default(),
             charge_pending: None,
             charge_custom_open: false,
+            daemon_uptime_s: None,
+            battery: None,
             refresh_rate: RefreshRate::default(),
             last_refresh: Instant::now() - Duration::from_secs(5),
             status: "Connecting...".to_string(),
             last_error: None,
             notice: None,
             restore_defaults_confirm_open: false,
-            led_breathing_preset: BreathingPreset::Smooth,
+            led_breathing_preset: DEFAULT_BREATH_PRESET,
             led_breathing_advanced_open: false,
+            led_sleep_open: false,
+            led_sleep_custom: 128,
+            led_sleep_breathing_preset: "sleep",
             led_step_up: BreathStep::Medium,
             led_step_down: BreathStep::Medium,
             led_delay_at_max: BreathDelay::Ms250,
@@ -746,14 +729,43 @@ impl LecooApp {
             }
         }
 
-        if let IpcResponse::Temps { cpu_c, sys_c } = self.request(&IpcRequest::GetTemperatures)? {
-            self.metrics.cpu_temp = Some(cpu_c);
-            self.metrics.sys_temp = Some(sys_c);
+        // 温度/转速走 daemon 的指标管道：`live` 是"我在看，按这个间隔采"的租约，
+        // daemon 空闲时自己每分钟采一次，有人看才加速（最快 1 秒）。
+        // 这样 GUI 轮询从 2 个请求降到 1 个，也不再逼 daemon 每次都直接读 EC。
+        let live_ms = self.refresh_rate.as_duration().as_millis().min(u16::MAX as u128) as u16;
+        match self.request(&IpcRequest::GetMetrics {
+            live: Some(live_ms),
+            since: None,
+        })? {
+            IpcResponse::Metrics(m) => {
+                if let Some(s) = m.last {
+                    self.metrics.cpu_temp = Some(s.cpu_c);
+                    self.metrics.sys_temp = Some(s.sys_c);
+                    self.metrics.cpu_rpm = Some(s.cpu_fan_rpm);
+                    self.metrics.gpu_rpm = Some(s.gpu_fan_rpm);
+                    self.daemon_uptime_s = Some(s.uptime_s);
+                }
+            }
+            // 老 daemon 不认 GetMetrics：退回两次直接读，保证监控卡片不会一直空着
+            _ => {
+                if let IpcResponse::Temps { cpu_c, sys_c } =
+                    self.request(&IpcRequest::GetTemperatures)?
+                {
+                    self.metrics.cpu_temp = Some(cpu_c);
+                    self.metrics.sys_temp = Some(sys_c);
+                }
+                if let IpcResponse::FanRpm { cpu, gpu } = self.request(&IpcRequest::GetFansRPM)? {
+                    self.metrics.cpu_rpm = Some(cpu);
+                    self.metrics.gpu_rpm = Some(gpu);
+                }
+            }
         }
 
-        if let IpcResponse::FanRpm { cpu, gpu } = self.request(&IpcRequest::GetFansRPM)? {
-            self.metrics.cpu_rpm = Some(cpu);
-            self.metrics.gpu_rpm = Some(gpu);
+        // 电池详情只有支持的板子才有（N155D 之类没有）
+        if self.caps.as_ref().is_some_and(|c| c.battery_info)
+            && let IpcResponse::BatteryInfo(info) = self.request(&IpcRequest::GetBatteryInfo)?
+        {
+            self.battery = Some(info);
         }
 
         if let IpcResponse::ChargeStatus(status) = self.request(&IpcRequest::GetChargeStatus)? {
@@ -767,10 +779,19 @@ impl LecooApp {
         let settings_resp = self.request(&IpcRequest::DaemonCommand(DaemonCommand::GetSettings))?;
         if let IpcResponse::Settings(settings) = settings_resp {
             let settings = *settings;
+            // led_on_sleep 会随 settings 一起被 move 进 AppDraft，先留一份给本地的编辑状态
+            let sleep_mode = settings.led_on_sleep;
             self.current = settings.clone();
             if force_sync_draft || !self.has_pending_changes() {
                 self.draft = AppDraft::from(settings);
                 self.sync_led_ui_from_mode(self.draft.led_mode);
+                match sleep_mode {
+                    PowerLedMode::Animation(c) => {
+                        self.led_sleep_breathing_preset = breath_preset_of(c);
+                    }
+                    PowerLedMode::Custom(v) => self.led_sleep_custom = v,
+                    PowerLedMode::Auto => {}
+                }
             }
             if force_sync_draft {
                 // 只在"重新从 daemon 读一遍"时决定自定义视图要不要展开
@@ -789,7 +810,7 @@ impl LecooApp {
 
     fn sync_led_ui_from_mode(&mut self, mode: PowerLedMode) {
         if let PowerLedMode::Animation(config) = mode {
-            self.led_breathing_preset = preset_from_breath_config(config);
+            self.led_breathing_preset = breath_preset_of(config);
             self.led_step_up = config.step_up;
             self.led_step_down = config.step_down;
             self.led_delay_at_max = config.delay_at_max;
@@ -820,6 +841,9 @@ impl LecooApp {
             count += 1;
         }
         if self.draft.led_mode != self.current.led_mode {
+            count += 1;
+        }
+        if self.draft.led_on_sleep != self.current.led_on_sleep {
             count += 1;
         }
         if self.draft.telemetry_enabled != self.current.telemetry_enabled {
@@ -893,6 +917,15 @@ impl LecooApp {
                 self.request_action("Set LED mode", &IpcRequest::SetLedMode(self.draft.led_mode))
         {
             errors.push(format!("LED mode: {}", err));
+        }
+
+        if self.draft.led_on_sleep != self.current.led_on_sleep
+            && let Err(err) = self.request_action(
+                "Set LED on sleep",
+                &IpcRequest::DaemonCommand(DaemonCommand::SetLedOnSleep(self.draft.led_on_sleep)),
+            )
+        {
+            errors.push(format!("LED on sleep: {}", err));
         }
 
         if self.draft.telemetry_enabled != self.current.telemetry_enabled
@@ -1145,29 +1178,46 @@ impl LecooApp {
             .num_columns(columns)
             .spacing([spacing, spacing])
             .show(ui, |ui| {
-                for idx in 0..7 {
-                    let card_height = self.card_height_for(idx);
-                    ui.vertical(|ui| {
-                        ui.set_min_width(card_width);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(card_width, card_height),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| self.render_card_by_index(ui, idx, card_height),
-                        );
-                    });
-                    if (idx + 1) % columns == 0 {
-                        ui.end_row();
+                let mut slot = 0;
+                while slot < CARD_COUNT {
+                    // 一行内所有卡片取最高的那个高度，让边框对齐——
+                    // 否则矮卡片只填到自己的高度，下面留一条难看的空白。
+                    let row_len = (CARD_COUNT - slot).min(columns);
+                    let row_height = (0..row_len)
+                        .map(|i| self.card_height_for(CARD_ORDER[slot + i]))
+                        .fold(0.0_f32, f32::max);
+
+                    for i in 0..row_len {
+                        let idx = CARD_ORDER[slot + i];
+                        ui.vertical(|ui| {
+                            ui.set_min_width(card_width);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(card_width, row_height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.render_card_by_index(ui, idx, row_height),
+                            );
+                        });
                     }
+                    ui.end_row();
+                    slot += row_len;
                 }
             });
     }
 
-    fn card_height_for(&self, idx: usize) -> f32 {
-        match idx {
-            0 => 120.0, // Monitoring card has a second column for battery health + power source.
+    fn card_height_for(&self, idx: usize) -> f32 {        match idx {
+            0 => {
+                // 有电池详情卡时，监控卡只留温度/风扇（两列各两行，更矮）；
+                // 板子没有 battery_info 时，监控卡继续兼放电池那三项作为兜底。
+                if self.caps.as_ref().is_some_and(|c| c.battery_info) {
+                    80.0
+                } else {
+                    120.0
+                }
+            }
             2 => 150.0, // Fan card needs extra space for two editors + sliders.
             4 => 120.0, // Power LED card needs space for breathing presets + Advanced panel
             5 => 130.0, // Charge card: two info labels + Presets/Custom tabs + buttons or sliders
+            7 => 130.0, // Battery card: title + five detail rows
             _ => 80.0,
         }
     }
@@ -1175,6 +1225,7 @@ impl LecooApp {
     fn render_card_by_index(&mut self, ui: &mut egui::Ui, idx: usize, card_height: f32) {
         match idx {
             0 => {
+                let battery_card_takes_over = self.caps.as_ref().is_some_and(|c| c.battery_info);
                 render_fixed_card(ui, card_height, "Realtime Monitoring", |ui| {
                     ui.columns(2, |columns| {
                         columns[0].label(format!(
@@ -1185,27 +1236,30 @@ impl LecooApp {
                             "System temp: {} °C",
                             fmt_opt_u8(self.metrics.sys_temp)
                         ));
-                        columns[0].label(format!(
+                        columns[1].label(format!(
                             "CPU fan: {} RPM",
                             fmt_opt_u16(self.metrics.cpu_rpm)
                         ));
-                        columns[0].label(format!(
+                        columns[1].label(format!(
                             "GPU fan: {} RPM",
                             fmt_opt_u16(self.metrics.gpu_rpm)
                         ));
-                        columns[0].label(format!(
-                            "Battery: {}%",
-                            fmt_opt_u8(self.metrics.battery_percent)
-                        ));
 
-                        columns[1].label(format!(
-                            "Health: {}",
-                            fmt_battery_health(self.metrics.battery_health)
-                        ));
-                        columns[1].label(format!(
-                            "Power: {}",
-                            fmt_power_source(self.metrics.power_source)
-                        ));
+                        // 兜底：没有电池详情卡的板子，这三项只能留在这儿
+                        if !battery_card_takes_over {
+                            columns[0].label(format!(
+                                "Battery: {}%",
+                                fmt_opt_u8(self.metrics.battery_percent)
+                            ));
+                            columns[1].label(format!(
+                                "Health: {}",
+                                fmt_battery_health(self.metrics.battery_health)
+                            ));
+                            columns[1].label(format!(
+                                "Source: {}",
+                                fmt_power_source(self.metrics.power_source)
+                            ));
+                        }
                     });
                 });
             }
@@ -1344,7 +1398,7 @@ impl LecooApp {
                                 .selectable_label(breathing_selected, "Breathing")
                                 .clicked()
                             {
-                                let config = self.led_breathing_preset.to_breath_config();
+                                let config = breath_config_of(self.led_breathing_preset);
                                 self.led_step_up = config.step_up;
                                 self.led_step_down = config.step_down;
                                 self.led_delay_at_max = config.delay_at_max;
@@ -1379,66 +1433,19 @@ impl LecooApp {
                     ui.add_enabled_ui(breathing_active && animation_enabled, |ui| {
                         let previous_preset = self.led_breathing_preset;
                         egui::ComboBox::from_id_salt("breathing_preset")
-                            .selected_text(self.led_breathing_preset.label())
+                            .selected_text(breath_label(self.led_breathing_preset))
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Smooth,
-                                    "Smooth",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Sleep,
-                                    "Sleep",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Alert,
-                                    "Alert",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Zen,
-                                    "Zen",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Ping,
-                                    "Ping",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Energetic,
-                                    "Energetic",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Warning,
-                                    "Warning",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Vacuum,
-                                    "Vacuum",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Panic,
-                                    "Panic",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Sonar,
-                                    "Sonar",
-                                );
-                                ui.selectable_value(
-                                    &mut self.led_breathing_preset,
-                                    BreathingPreset::Toxic,
-                                    "Toxic",
-                                );
+                                // 直接遍历上游的预设表：以后新增动画不用改这里
+                                for (name, _) in BreathConfig::PRESETS {
+                                    ui.selectable_value(
+                                        &mut self.led_breathing_preset,
+                                        *name,
+                                        breath_label(name),
+                                    );
+                                }
                             });
                         if self.led_breathing_preset != previous_preset {
-                            let config = self.led_breathing_preset.to_breath_config();
+                            let config = breath_config_of(self.led_breathing_preset);
                             self.led_step_up = config.step_up;
                             self.led_step_down = config.step_down;
                             self.led_delay_at_max = config.delay_at_max;
@@ -1446,8 +1453,10 @@ impl LecooApp {
                         }
 
                         ui.horizontal(|ui| {
+                            // egui 默认字体里没有 U+25BC（▼），展开时会渲染成豆腐块，
+                            // 所以展开态用 ASCII 的 "v"；"▶"（U+25B6）是有的。
                             let advanced_button_text = if self.led_breathing_advanced_open {
-                                "▼ Advanced"
+                                "v Advanced"
                             } else {
                                 "▶ Advanced"
                             };
@@ -1605,7 +1614,7 @@ impl LecooApp {
                         }
 
                         if breathing_active {
-                            let mut breath_config = self.led_breathing_preset.to_breath_config();
+                            let mut breath_config = breath_config_of(self.led_breathing_preset);
                             // Keep selected timing in sync even when Advanced panel is collapsed.
                             breath_config.step_up = self.led_step_up;
                             breath_config.step_down = self.led_step_down;
@@ -1614,6 +1623,92 @@ impl LecooApp {
                             self.draft.led_mode = PowerLedMode::Animation(breath_config);
                         }
                     });
+
+                    // ---- 睡眠时的灯效（DaemonCommand::SetLedOnSleep）----
+                    // 折叠起来时不占高度；展开后复用和上面同一套三种模式。
+                    ui.horizontal(|ui| {
+                        let arrow = if self.led_sleep_open { "v" } else { "▶" };
+                        if ui.button(format!("{arrow} On sleep")).clicked() {
+                            self.led_sleep_open = !self.led_sleep_open;
+                        }
+                        ui.label(fmt_led_mode(self.draft.led_on_sleep));
+                    });
+                    if self.led_sleep_open {
+                        ui.add_enabled_ui(led_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        matches!(self.draft.led_on_sleep, PowerLedMode::Auto),
+                                        "Auto",
+                                    )
+                                    .clicked()
+                                {
+                                    self.draft.led_on_sleep = PowerLedMode::Auto;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(self.draft.led_on_sleep, PowerLedMode::Custom(_)),
+                                        "Fixed",
+                                    )
+                                    .clicked()
+                                {
+                                    self.draft.led_on_sleep =
+                                        PowerLedMode::Custom(self.led_sleep_custom);
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.draft.led_on_sleep,
+                                            PowerLedMode::Animation(_)
+                                        ),
+                                        "Breathing",
+                                    )
+                                    .clicked()
+                                {
+                                    self.draft.led_on_sleep = PowerLedMode::Animation(
+                                        breath_config_of(self.led_sleep_breathing_preset),
+                                    );
+                                }
+                            });
+
+                            let sleep_custom =
+                                matches!(self.draft.led_on_sleep, PowerLedMode::Custom(_));
+                            ui.add_enabled_ui(sleep_custom && brightness_enabled, |ui| {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.led_sleep_custom, 0..=255)
+                                            .text("Brightness"),
+                                    )
+                                    .changed()
+                                {
+                                    self.draft.led_on_sleep =
+                                        PowerLedMode::Custom(self.led_sleep_custom);
+                                }
+                            });
+
+                            let sleep_breath =
+                                matches!(self.draft.led_on_sleep, PowerLedMode::Animation(_));
+                            ui.add_enabled_ui(sleep_breath && animation_enabled, |ui| {
+                                let previous = self.led_sleep_breathing_preset;
+                                egui::ComboBox::from_id_salt("sleep_breathing_preset")
+                                    .selected_text(breath_label(self.led_sleep_breathing_preset))
+                                    .show_ui(ui, |ui| {
+                                        for (name, _) in BreathConfig::PRESETS {
+                                            ui.selectable_value(
+                                                &mut self.led_sleep_breathing_preset,
+                                                *name,
+                                                breath_label(name),
+                                            );
+                                        }
+                                    });
+                                if self.led_sleep_breathing_preset != previous {
+                                    self.draft.led_on_sleep = PowerLedMode::Animation(
+                                        breath_config_of(self.led_sleep_breathing_preset),
+                                    );
+                                }
+                            });
+                        });
+                    }
 
                     render_sync_state(ui, self.draft.led_mode == self.current.led_mode);
                 });
@@ -1763,6 +1858,70 @@ impl LecooApp {
                         ui,
                         self.draft.telemetry_enabled == self.current.telemetry_enabled,
                     );
+                });
+            }
+            7 => {
+                let battery_available = self.caps.as_ref().map(|c| c.battery_info);
+                let info = self.battery;
+                // 电源状态（AC/充电中/放电中）只有 WMI 有，daemon 的 IPC 不提供
+                let power_source = self.metrics.power_source;
+                // ETA 需要知道"打算充到多少"：Full 就是 100%，其余用充电阈值的上限
+                let stop_pct = match (self.current.charge, self.metrics.charge_max) {
+                    (ChargeIntent::Full, _) => 100,
+                    (_, Some(max)) if max > 0 => max,
+                    _ => 100,
+                };
+                render_fixed_card(ui, card_height, "Battery", |ui| {
+                    let Some(b) = info else {
+                        ui.label(if battery_available == Some(true) {
+                            "Reading…"
+                        } else {
+                            caps_note(battery_available)
+                        });
+                        return;
+                    };
+                    // 用 Grid 而不是空格拼接，第二列才会真正对齐（原来的写法里
+                    // Cycles / Source / Time left 各自跟着上一段文字的长度飘）
+                    egui::Grid::new("battery_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label(format!("Health: {}", fmt_pct_f32(b.health_pct())));
+                            ui.label(format!("Cycles: {}", b.cycles));
+                            ui.end_row();
+
+                            ui.label(format!(
+                                "Charge: {} mAh ({})",
+                                b.remaining_mah,
+                                fmt_pct_f32(b.charge_pct())
+                            ));
+                            ui.label(format!("Source: {}", fmt_power_source(power_source)));
+                            ui.end_row();
+
+                            ui.label(format!("Capacity: {} mAh", b.full_mah));
+                            ui.label(format!("Design: {} mAh", b.design_mah));
+                            ui.end_row();
+
+                            ui.label(format!("Voltage: {:.2} V", b.voltage_mv as f32 / 1000.0));
+                            ui.label(fmt_cell_voltage(&b));
+                            ui.end_row();
+
+                            let flow = if b.current_ma < 0 {
+                                "discharging"
+                            } else if b.current_ma > 0 {
+                                "charging"
+                            } else {
+                                "idle"
+                            };
+                            ui.label(format!("Power: {:.1} W ({flow})", b.power_w().abs()));
+                            ui.label(format!("ETA: {}", fmt_eta(b.eta_min(stop_pct))))
+                                .on_hover_text(
+                                    "Estimated time remaining: until empty while discharging, \
+                                     or until the charge limit while charging.\n\
+                                     Linear estimate, so charging past ~90% reads optimistic.",
+                                );
+                            ui.end_row();
+                        });
                 });
             }
             _ => {}
@@ -2059,6 +2218,32 @@ fn fmt_power_source(v: Option<PowerSourceStatus>) -> &'static str {
     v.map(|p| p.label()).unwrap_or("…")
 }
 
+// ---------- 电池详情卡片的格式化 ----------
+
+fn fmt_pct_f32(v: Option<f32>) -> String {
+    v.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "-".to_string())
+}
+
+/// EC 只给总电压，每节是平均值（`BatteryInfo::cell_mv` 也是这么算的）
+fn fmt_cell_voltage(b: &BatteryInfo) -> String {
+    match (b.cell_mv(), b.cells) {
+        (Some(mv), cells) if cells > 1 => {
+            format!("{:.3} V/cell × {}", mv as f32 / 1000.0, cells)
+        }
+        (Some(mv), _) => format!("{:.3} V/cell", mv as f32 / 1000.0),
+        (None, _) => "cells unknown".to_string(),
+    }
+}
+
+/// 分钟 -> "2h 15m" / "45m"
+fn fmt_eta(minutes: Option<u32>) -> String {
+    match minutes {
+        Some(m) if m >= 60 => format!("{}h {:02}m", m / 60, m % 60),
+        Some(m) => format!("{m}m"),
+        None => "-".to_string(),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn activate_existing_window() -> bool {
     // This title must exactly match the first argument passed to run_native
@@ -2338,11 +2523,12 @@ fn fan_editor(
     duty_max: Option<u8>,
     note: &str,
 ) {
-    ui.label(format!("{} current: {}", title, fmt_fan_mode(current)));
-
+    // 紧凑布局：标题 + 四个档位挤在同一行，滑块单独一行占满宽度。
+    // 原来各占一行的 "CPU current: Auto" 和 "Safe max: 220" 都挪进了悬停提示。
     let Some(duty_max) = duty_max else {
+        ui.label(title).on_hover_text(format!("Applied: {}", fmt_fan_mode(current)));
         ui.add_enabled_ui(false, |ui| {
-            ui.label(note);
+            ui.small(note);
         });
         return;
     };
@@ -2360,6 +2546,8 @@ fn fan_editor(
     };
 
     ui.horizontal(|ui| {
+        ui.label(title)
+            .on_hover_text(format!("Applied: {}", fmt_fan_mode(current)));
         ui.radio_value(&mut selected, 0, "Auto");
         ui.radio_value(&mut selected, 1, "Full");
         ui.radio_value(&mut selected, 2, "Turbo");
@@ -2367,8 +2555,9 @@ fn fan_editor(
     });
 
     ui.add_enabled_ui(selected == 3, |ui| {
-        ui.add(egui::Slider::new(&mut custom_pwm, 0..=duty_max).text(format!("{} PWM", title)));
-        ui.small(format!("Safe max: {duty_max}"));
+        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(80.0);
+        ui.add(egui::Slider::new(&mut custom_pwm, 0..=duty_max))
+            .on_hover_text(format!("Safe max: {duty_max}"));
     });
 
     *draft = match selected {
