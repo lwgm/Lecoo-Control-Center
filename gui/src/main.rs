@@ -476,18 +476,19 @@ impl BreathingPreset {
     }
 
     fn to_breath_config(self) -> BreathConfig {
+        // 上游 0.6.0 把这批构造函数改成了同名的大写关联常量（`smooth()` -> `SMOOTH`）
         match self {
-            Self::Smooth => BreathConfig::smooth(),
-            Self::Sleep => BreathConfig::sleep(),
-            Self::Alert => BreathConfig::alert(),
-            Self::Zen => BreathConfig::zen(),
-            Self::Ping => BreathConfig::ping(),
-            Self::Energetic => BreathConfig::energetic(),
-            Self::Warning => BreathConfig::warning(),
-            Self::Vacuum => BreathConfig::vacuum(),
-            Self::Panic => BreathConfig::panic(),
-            Self::Sonar => BreathConfig::sonar(),
-            Self::Toxic => BreathConfig::toxic(),
+            Self::Smooth => BreathConfig::SMOOTH,
+            Self::Sleep => BreathConfig::SLEEP,
+            Self::Alert => BreathConfig::ALERT,
+            Self::Zen => BreathConfig::ZEN,
+            Self::Ping => BreathConfig::PING,
+            Self::Energetic => BreathConfig::ENERGETIC,
+            Self::Warning => BreathConfig::WARNING,
+            Self::Vacuum => BreathConfig::VACUUM,
+            Self::Panic => BreathConfig::PANIC,
+            Self::Sonar => BreathConfig::SONAR,
+            Self::Toxic => BreathConfig::TOXIC,
         }
     }
 }
